@@ -1,0 +1,4 @@
+mount_smbfs //macbook@192.168.1.21/media /Volumes/root_cfo216/cfo216_media
+
+
+sudo mount_nfs -o vers=3,tcp,resvport 192.168.1.182:/volume1/photo /Volumes/root_cfo211/cfo211_photo
