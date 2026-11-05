@@ -11,7 +11,7 @@ import psycopg
 from psycopg import sql
 
 # ---------- Configuration ----------
-#export PHOTOPROCESS_DB_PASSWORD='tofer2578'
+#git
 
 
 DB_HOST = "192.168.1.160"
