@@ -90,13 +90,36 @@ def ensure_schema(conn):
                 id BIGSERIAL PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 discovered_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                status TEXT CHECK (status IS NULL OR status = 'processed'),
+                status TEXT CHECK (status IS NULL OR status IN ('processed', 'processed_with_errors')),
                 processed_date TIMESTAMPTZ,
                 CHECK (
                     (status IS NULL AND processed_date IS NULL)
-                    OR (status = 'processed' AND processed_date IS NOT NULL)
+                    OR (status IN ('processed', 'processed_with_errors') AND processed_date IS NOT NULL)
                 )
             )
+            """
+        )
+        # Migrate constraints created by earlier versions of this script.
+        cursor.execute(
+            """
+            ALTER TABLE folders
+                DROP CONSTRAINT IF EXISTS folders_status_check,
+                DROP CONSTRAINT IF EXISTS folders_check,
+                DROP CONSTRAINT IF EXISTS folders_status_allowed_check,
+                DROP CONSTRAINT IF EXISTS folders_processed_date_check
+            """
+        )
+        cursor.execute(
+            """
+            ALTER TABLE folders
+                ADD CONSTRAINT folders_status_allowed_check
+                    CHECK (status IS NULL OR status IN ('processed', 'processed_with_errors')),
+                ADD CONSTRAINT folders_processed_date_check
+                    CHECK (
+                        (status IS NULL AND processed_date IS NULL)
+                        OR (status IN ('processed', 'processed_with_errors')
+                            AND processed_date IS NOT NULL)
+                    )
             """
         )
         cursor.execute(
@@ -129,6 +152,25 @@ def ensure_schema(conn):
             """
             CREATE INDEX IF NOT EXISTS processing_errors_folder_time_idx
             ON processing_errors (folder_id, occurred_at)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corrupted_files (
+                id BIGSERIAL PRIMARY KEY,
+                folder_id BIGINT NOT NULL
+                    REFERENCES folders(id) ON DELETE CASCADE,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                file_path TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                exit_code INTEGER
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS corrupted_files_folder_time_idx
+            ON corrupted_files (folder_id, occurred_at)
             """
         )
 
@@ -198,10 +240,190 @@ def inventory(root):
     print("Next: run the export command.")
 
 
-def export():
-    """Read metadata for unprocessed inventory folders into PostgreSQL."""
+def recover_error_folders(conn):
+    """Check every file individually in folders recorded in processing_errors."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT f.id, f.path
+            FROM folders AS f
+            WHERE EXISTS (
+                SELECT 1
+                FROM processing_errors AS pe
+                WHERE pe.folder_id = f.id
+            )
+            ORDER BY f.path
+            """
+        )
+        pending = cursor.fetchall()
+
+    if not pending:
+        print("No folders with processing errors were found.")
+        return
+
+    print(f"Checking {len(pending)} folders file by file")
+
+    metadata_columns = sql.SQL(", ").join(
+        sql.Identifier(field) for field in FIELDS
+    )
+    metadata_placeholders = sql.SQL(", ").join(
+        [sql.Placeholder()] * len(FIELDS)
+    )
+    metadata_updates = sql.SQL(", ").join(
+        sql.SQL("{} = EXCLUDED.{}").format(
+            sql.Identifier(field), sql.Identifier(field)
+        )
+        for field in FIELDS
+    )
+    insert_metadata = sql.SQL(
+        """
+        INSERT INTO file_metadata (folder_id, {})
+        VALUES ({})
+        ON CONFLICT (folder_id, "FilePath") DO UPDATE SET {}
+        """
+    ).format(
+        metadata_columns,
+        sql.SQL(", ").join(
+            [sql.Placeholder(), metadata_placeholders]
+        ),
+        metadata_updates,
+    )
+
+    for folder_index, (folder_id, folder) in enumerate(pending, start=1):
+        print(f"[{folder_index}/{len(pending)}] {folder}", flush=True)
+        corrupted_rows = []
+        metadata_rows = []
+
+        try:
+            with os.scandir(folder) as entries:
+                files = sorted(
+                    (entry.path for entry in entries if entry.is_file()),
+                    key=str.casefold,
+                )
+        except OSError as exc:
+            # The folder itself cannot be inspected. Preserve the diagnostic
+            # in corrupted_files using the folder path as the affected path.
+            corrupted_rows.append(
+                (folder_id, folder, f"Cannot enumerate folder: {exc}", None)
+            )
+            files = []
+
+        for file_index, file_path in enumerate(files, start=1):
+            print(
+                f"    [{file_index}/{len(files)}] {Path(file_path).name}",
+                flush=True,
+            )
+            command = [
+                "exiftool",
+                "-json",
+                "-charset",
+                "filename=UTF8",
+                *[f"-{field}" for field in FIELDS],
+                file_path,
+            ]
+
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                records = json.loads(result.stdout or "[]")
+                if not isinstance(records, list) or not all(
+                    isinstance(record, dict) for record in records
+                ):
+                    raise ValueError("ExifTool returned an unexpected JSON structure")
+
+                record_error = next(
+                    (record.get("Error") for record in records if record.get("Error")),
+                    None,
+                )
+                if result.returncode != 0:
+                    error_message = result.stderr.strip() or record_error or (
+                        f"ExifTool exited with status {result.returncode}"
+                    )
+                    corrupted_rows.append(
+                        (folder_id, file_path, error_message, result.returncode)
+                    )
+                elif record_error:
+                    corrupted_rows.append(
+                        (folder_id, file_path, str(record_error), result.returncode)
+                    )
+                elif not records:
+                    corrupted_rows.append(
+                        (folder_id, file_path, "ExifTool returned no file record", result.returncode)
+                    )
+                else:
+                    metadata_rows.extend(
+                        (folder_id, *metadata_values(record))
+                        for record in records
+                    )
+
+            except OSError as exc:
+                corrupted_rows.append(
+                    (folder_id, file_path, f"Cannot run ExifTool: {exc}", None)
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                details = result.stderr.strip() if "result" in locals() else ""
+                error_message = f"Invalid ExifTool response: {exc}"
+                if details:
+                    error_message += f"; stderr: {details}"
+                corrupted_rows.append(
+                    (folder_id, file_path, error_message, getattr(locals().get("result"), "returncode", None))
+                )
+
+        # Replace this folder's previous corruption snapshot, clear its
+        # processing_errors, and mark it complete in one database transaction.
+        with conn.transaction():
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM corrupted_files WHERE folder_id = %s",
+                    (folder_id,),
+                )
+                if metadata_rows:
+                    cursor.executemany(insert_metadata, metadata_rows)
+                if corrupted_rows:
+                    cursor.executemany(
+                        """
+                        INSERT INTO corrupted_files
+                            (folder_id, file_path, error_message, exit_code)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        corrupted_rows,
+                    )
+                cursor.execute(
+                    "DELETE FROM processing_errors WHERE folder_id = %s",
+                    (folder_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE folders
+                    SET status = 'processed_with_errors', processed_date = NOW()
+                    WHERE id = %s
+                    """,
+                    (folder_id,),
+                )
+
+        print(
+            f"    Finished: {len(files)} files checked, "
+            f"{len(corrupted_rows)} corrupted/unreadable entries recorded"
+        )
+
+    print("Error recovery complete.")
+
+
+def export(mode="export"):
+    """Export pending folders, or recover folders recorded in processing_errors."""
     with psycopg.connect(**database_settings(), autocommit=True) as conn:
         ensure_schema(conn)
+
+        if mode == "errors":
+            recover_error_folders(conn)
+            return
+
         with conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -222,7 +444,7 @@ def export():
             print("Export is already complete.")
             return
 
-        print(f"Processing {len(pending)} folders")
+        print(f"Processing {len(pending)} folders in export mode")
 
         columns = sql.SQL(", ").join(
             sql.Identifier(field) for field in FIELDS
@@ -234,17 +456,11 @@ def export():
             "INSERT INTO file_metadata (folder_id, {}) VALUES ({})"
         ).format(
             columns,
-            sql.SQL(", ").join(
-                [sql.Placeholder(), placeholders]
-            ),
+            sql.SQL(", ").join([sql.Placeholder(), placeholders]),
         )
 
         for index, (folder_id, folder) in enumerate(pending, start=1):
-            print(
-                f"[{index}/{len(pending)}] {folder}",
-                flush=True
-            )
-
+            print(f"[{index}/{len(pending)}] {folder}", flush=True)
             command = [
                 "exiftool",
                 "-json",
@@ -264,116 +480,94 @@ def export():
                     check=False,
                 )
             except OSError as exc:
-                message = f"ERROR: Cannot run ExifTool for {folder}: {exc}"
-                report_error(message)
-                save_processing_error(
-                    conn, folder_id, "exiftool_launch", str(exc)
-                )
+                report_error(f"ERROR: Cannot run ExifTool for {folder}: {exc}")
+                save_processing_error(conn, folder_id, "exiftool_launch", str(exc))
                 continue
 
             if result.returncode != 0:
                 details = result.stderr.strip() or (
-                    "ExifTool returned a nonzero exit code without "
-                    "writing a message to stderr."
+                    "ExifTool returned a nonzero exit code without writing to stderr."
                 )
-                message = (
-                    f"EXIFTOOL FAILED (exit {result.returncode}) for {folder}.\n"
-                    "Folder left pending: metadata was not saved and the "
-                    "export will continue with the next folder.\n"
-                    f"ExifTool diagnostic output:\n{details}"
-                )
-                report_error(message)
+                report_error(f"EXIFTOOL FAILED (exit {result.returncode}) for {folder}:\n{details}")
                 save_processing_error(
-                    conn,
-                    folder_id,
-                    "exiftool_command",
-                    details,
-                    result.returncode,
+                    conn, folder_id, "exiftool_command", details, result.returncode
                 )
 
             try:
                 records = json.loads(result.stdout or "[]")
-                if not isinstance(records, list):
-                    raise ValueError("Expected a JSON list")
-                if not all(isinstance(record, dict) for record in records):
-                    raise ValueError("Expected each JSON record to be an object")
+                if not isinstance(records, list) or not all(
+                    isinstance(record, dict) for record in records
+                ):
+                    raise ValueError("Expected a JSON list of objects")
             except (json.JSONDecodeError, ValueError) as exc:
-                message = (
-                    f"ERROR: Invalid ExifTool JSON for {folder} "
-                    f"(exit {result.returncode}): {exc}"
-                )
+                message = f"Invalid ExifTool JSON for {folder}: {exc}"
                 if result.stderr.strip():
                     message += f"\nExifTool diagnostic output:\n{result.stderr.strip()}"
                 report_error(message)
-                save_processing_error(
-                    conn,
-                    folder_id,
-                    "exiftool_json",
-                    message,
-                    result.returncode,
-                )
-                print("Folder remains pending; rerun export to retry.")
-                return
+                save_processing_error(conn, folder_id, "exiftool_json", message, result.returncode)
+                continue
 
-            file_errors = []
+            successful_records = [record for record in records if not record.get("Error")]
+            corrupted_rows = []
             for record in records:
                 error = record.get("Error")
                 if error:
-                    file_path = (
-                        record.get("FilePath")
-                        or record.get("SourceFile")
-                        or record.get("FileName")
-                        or folder
+                    file_path = record.get("SourceFile") or record.get("FilePath") or folder
+                    corrupted_rows.append(
+                        (folder_id, str(file_path), str(error), result.returncode)
                     )
-                    file_errors.append(f"{file_path}: {error}")
-                    file_error_message = (
-                        f"EXIFTOOL FILE ERROR for {file_path} "
-                        f"(folder {folder}): {error}"
-                    )
-                    report_error(file_error_message)
                     save_processing_error(
-                        conn,
-                        folder_id,
-                        "exiftool_file",
-                        file_error_message,
+                        conn, folder_id, "exiftool_file",
+                        f"EXIFTOOL FILE ERROR for {file_path}: {error}",
                         result.returncode,
                     )
 
-            if result.returncode != 0 or file_errors:
-                continue
-
             with conn.transaction():
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        "DELETE FROM file_metadata WHERE folder_id = %s",
-                        (folder_id,),
-                    )
-                    if records:
+                    cursor.execute("DELETE FROM file_metadata WHERE folder_id = %s", (folder_id,))
+                    if result.returncode == 0 or corrupted_rows:
+                        cursor.execute(
+                            "DELETE FROM corrupted_files WHERE folder_id = %s",
+                            (folder_id,),
+                        )
+                    if result.returncode == 0 and successful_records:
                         cursor.executemany(
                             insert_metadata,
-                            [
-                                (folder_id, *metadata_values(record))
-                                for record in records
-                            ],
+                            [(folder_id, *metadata_values(record)) for record in successful_records],
                         )
-                    cursor.execute(
-                        """
-                        UPDATE folders
-                        SET status = 'processed', processed_date = NOW()
-                        WHERE id = %s
-                        """,
-                        (folder_id,),
-                    )
-    print("Export complete.")
-    print("Export complete.")
+                    if corrupted_rows:
+                        cursor.executemany(
+                            """
+                            INSERT INTO corrupted_files
+                                (folder_id, file_path, error_message, exit_code)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            corrupted_rows,
+                        )
+                    if result.returncode == 0 or corrupted_rows:
+                        cursor.execute(
+                            """
+                            UPDATE folders
+                            SET status = 'processed', processed_date = NOW()
+                            WHERE id = %s
+                            """,
+                            (folder_id,),
+                        )
+                    else:
+                        print(
+                            "Folder remains pending: ExifTool returned a nonzero "
+                            "exit code but identified no individual failed files."
+                        )
 
+    print("Export complete.")
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(
             "Usage:\n"
             "  python3 main.py inventory /path/to/drive\n"
-            "  python3 main.py export"
+            "  python3 main.py export\n"
+            "  python3 main.py errors"
         )
 
     try:
@@ -385,10 +579,15 @@ def main():
         elif sys.argv[1] == "export":
             if len(sys.argv) != 2:
                 sys.exit("The export command takes no extra arguments.")
-            export()
+            export(mode="export")
+
+        elif sys.argv[1] == "errors":
+            if len(sys.argv) != 2:
+                sys.exit("The errors command takes no extra arguments.")
+            export(mode="errors")
 
         else:
-            sys.exit("Unknown command. Use inventory or export.")
+            sys.exit("Unknown command. Use inventory, export or errors.")
     except (psycopg.Error, RuntimeError, ValueError) as exc:
         message = f"ERROR: PostgreSQL operation failed: {exc}"
         report_error(message)

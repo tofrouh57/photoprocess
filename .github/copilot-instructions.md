@@ -1,30 +1,29 @@
-# Copilot Instructions
+# Copilot Instructions for PhotoProcess
 
-## Project architecture
+## Build, test, and lint
 
-This repository is a small Python photo-library workflow backed by PostgreSQL:
-
-- `main.py` provides the `inventory` and `export` CLI commands. Inventory discovers directories, updates the `folders` table, and writes the export manifest. Export reads that manifest, runs ExifTool for folders not marked processed, and stores selected fields from `FIELDS` in `file_metadata`.
-- `folders_ui.py` is a Tkinter browser for searching, resetting, and deleting folder rows. It imports the database helpers from `main.py`.
-- `hash_photos.py` reads image paths from `file_metadata`, computes SHA-256 hashes, and upserts results into `file_content_hashes`. It also uses the shared database and error-reporting helpers from `main.py`.
-- `main.py` creates the core PostgreSQL tables. Metadata fields are derived from `FIELDS`; values are stored as text, with list/dict values serialized as JSON. Folder-related tables use foreign keys.
-- `metadata_folders.json` and `metadata_errors.log` are local workflow files located beside `main.py`, regardless of the command's current working directory.
-
-### Verify inventory and status behavior before changing it
-
-The current `main.py` and `folders_ui.py` do not agree on pending-folder status: the schema allows `NULL` or `processed`, and inventory resets discovered rows to `NULL`, while the UI filters for and writes `pending`. The README also describes inventory/export behavior that differs from the current `main.py`. Before changing this workflow, verify the implementation across all three files and keep schema, CLI, UI, and README behavior aligned.
-
-## Commands
-
-Install the Python dependency:
+Project setup:
 
 ```sh
 python3 -m pip install -r requirements.txt
 ```
 
-Set `PHOTOPROCESS_DB_PASSWORD` in the environment before running database-backed commands. Optional connection overrides are `PHOTOPROCESS_DB_HOST`, `PHOTOPROCESS_DB_PORT`, `PHOTOPROCESS_DB_NAME`, and `PHOTOPROCESS_DB_USER`.
+Database-backed commands require a password in the same shell session:
 
-Run the workflow and utilities from the repository root:
+```sh
+export PHOTOPROCESS_DB_PASSWORD='your-database-password'
+```
+
+Optional overrides:
+
+```sh
+export PHOTOPROCESS_DB_HOST='192.168.1.160'
+export PHOTOPROCESS_DB_PORT='5432'
+export PHOTOPROCESS_DB_NAME='photoprocess_debian'
+export PHOTOPROCESS_DB_USER='postgres'
+```
+
+Run the workflow from the repository root:
 
 ```sh
 python3 main.py inventory /path/to/photo-library
@@ -33,15 +32,38 @@ python3 folders_ui.py
 python3 hash_photos.py
 ```
 
-ExifTool must be installed and available on `PATH` for export.
+ExifTool must be installed and available on `PATH` for `export`.
 
-There is no configured build, lint, or automated test command, and no test suite or single-test selector is present in the repository.
+There is no configured lint command, no build step, and no automated test suite in this repository. There is no single-test selector to call; when adding tests, prefer the repository's standard Python test runner if one is introduced later.
 
-## Codebase conventions
+## High-level architecture
 
-- Reuse `database_settings()`, `ensure_schema()`, and `report_error()` from `main.py` in database utilities rather than duplicating connection or error-handling logic.
-- Use Psycopg SQL composition (`sql.Identifier`/`sql.SQL`) for dynamic SQL identifiers and parameter placeholders for values.
-- Keep database writes transaction-scoped. Export replaces a folder's metadata and marks it processed together; preserve retry behavior by leaving failed folders unprocessed.
-- Invoke ExifTool with a subprocess argument list, not through a shell. Keep filesystem paths as argument values.
-- Report operational errors to stderr and the local error log; processing failures should also be recorded in `processing_errors` where the workflow currently does so.
-- Keep generated manifests and logs anchored to `BASE` in `main.py`, not to the process working directory.
+This repository is a small PostgreSQL-backed photo processing workflow with three main moving parts:
+
+- `main.py` owns the shared schema, database helpers, and CLI entry points. It creates the `folders`, `file_metadata`, `processing_errors`, and `corrupted_files` tables, and it defines `database_settings()`, `ensure_schema()`, and `report_error()` for reuse.
+- `inventory` walks the target photo tree with `os.walk()` and stores discovered folder paths in the database. It is responsible for keeping folder state consistent with the UI and export pipeline.
+- `export` selects pending folders (`status IS NULL`), runs ExifTool per folder, stores selected metadata in `file_metadata`, and marks the folder as processed in the same transaction as the metadata replacement.
+- `folders_ui.py` is the Tkinter browser for inspecting and modifying folder rows. It must stay aligned with the database semantics in `main.py`; the README, UI, and schema all need to agree on what counts as pending/processed.
+- `hash_photos.py` queries exported image rows from `file_metadata`, hashes files on disk, and upserts results into `file_content_hashes`.
+
+Local workflow artifacts are anchored to the repository's `BASE` path rather than the current working directory:
+
+- `metadata_folders.json`
+- `metadata_errors.log`
+
+## Key conventions
+
+- Reuse the shared helpers from `main.py` instead of duplicating connection or error-handling logic in new scripts.
+- Use Psycopg SQL composition (`sql.Identifier`, `sql.SQL`) for dynamic table/column names and parameterized values for user data.
+- Keep writes transaction-scoped: a successful export must replace a folder's metadata and mark the folder as processed together; failed exports must leave the folder pending for retry.
+- Treat `status IS NULL` as pending and `status = 'processed'` as complete. When changing this behavior, verify the schema, CLI, UI, and README together.
+- Invoke ExifTool using a subprocess argument list, not a shell string, and keep filesystem paths as individual argument values.
+- Report operational failures to stderr and to the repository's error log; processing failures should also be recorded in `processing_errors` and related table entries when applicable.
+- Keep generated manifests and logs anchored to the project base directory in `main.py`, not the process working directory.
+- Be careful with `NULL`/`processed` semantics, because the current workflow is sensitive to pending-state mismatches between the database schema, CLI, and UI.
+
+## Repository-specific notes
+
+- This is a small Python CLI project, not a web app or package library.
+- Database configuration is environment-driven and intentionally not hard-coded in source control.
+- The project assumes PostgreSQL and ExifTool are already installed and reachable in the execution environment.
