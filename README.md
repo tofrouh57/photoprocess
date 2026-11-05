@@ -33,7 +33,7 @@ The default connection settings in `main.py` are:
 |---|---|
 | Host | `192.168.1.160` |
 | Port | `5432` |
-| Database | `photoprocess` |
+| Database | `photoprocess_debian` |
 | User | `postgres` |
 | Password | Read from `PHOTOPROCESS_DB_PASSWORD` |
 
@@ -53,6 +53,20 @@ export PHOTOPROCESS_DB_NAME='photoprocess'
 export PHOTOPROCESS_DB_USER='postgres'
 ```
 
+### Reset the PhotoProcess tables
+
+To drop the PhotoProcess tables and all their data while leaving the database
+itself and other tables untouched, run:
+
+```sh
+python3 reset_database.py
+```
+
+The script uses the same database environment variables and defaults above.
+It prompts for `RESET` before dropping the `public.file_content_hashes`,
+`public.processing_errors`, `public.file_metadata`, and `public.folders`
+tables. The application recreates its tables the next time it runs.
+
 Do not put the database password in `main.py` or commit it to source control.
 The password environment variable is only available to programs launched from
 that Terminal session. Set it again in a new session, or configure it through
@@ -61,8 +75,8 @@ your operating system's secret-management mechanism.
 ## Running the commands
 
 Run commands from the project directory, or provide the path to `main.py`.
-Generated local files are stored next to `main.py`, regardless of the current
-working directory.
+Inventory, processing state, metadata, and processing errors are stored in
+PostgreSQL; the commands do not create local manifest or log files.
 
 ### 1. Inventory a photo library
 
@@ -71,31 +85,23 @@ python3 main.py inventory /path/to/photo-library
 ```
 
 The root folder must exist. Inventory recursively discovers the root and its
-subfolders with `os.scandir()` and does not descend into symlinked directories.
-It uses the original filesystem name bytes for traversal and decodes valid
-UTF-8 paths without NFC/NFD normalization before storing them. Thus the
-manifest and PostgreSQL keep the actual spelling returned by the mounted
-filesystem. It then:
+subfolders with `os.walk()` and does not descend into symlinked directories.
+It then:
 
 - Creates the database tables and index if they do not already exist.
-- Inserts each discovered folder into `folders`.
-- Streams discovered paths into the existing JSON-array format in
-  `metadata_folders.json`, which a later `export` reads incrementally.
-- Inserts folders into PostgreSQL in batches rather than retaining the entire
-  folder inventory in memory.
-- Leaves existing folder rows unchanged, including their processing status
-  and processed timestamp. Newly discovered folders are inserted as pending.
-- Clears the local `metadata_errors.log` at the start of the inventory run.
+- Inserts newly discovered folders into `folders`; existing rows are left
+  unchanged, including their processing state.
+- Keeps folder paths and processing state in PostgreSQL, which is also the
+  source of folders for `export`.
 
-If one directory or entry cannot be accessed, inventory logs the path and
-continues with other entries. A folder whose name cannot be decoded as UTF-8
-is logged and skipped because PostgreSQL `TEXT` cannot store arbitrary
-non-UTF-8 filesystem bytes.
+If a directory cannot be accessed, inventory reports the warning to the
+terminal and continues with other entries.
 
 Existing database folder rows are not deleted if their paths are absent from
-the new inventory. Existing rows keep their IDs and original
-`discovered_date` and processing state. A newly encountered path gets a new
-folder row with `status = 'pending'` and a sequence-generated ID.
+the new inventory. Existing rows keep their IDs, original `discovered_date`,
+and current processing state. A newly encountered path gets a new folder row
+with a sequence-generated ID. In the database, `status IS NULL` means pending,
+and `status = 'processed'` means complete.
 
 ### Browse and manage folders
 
@@ -116,17 +122,15 @@ bound. The path filter treats plain text as a case-insensitive substring; SQL
 Select one or more rows in the folder list with the mouse (use Shift or
 Command-click to extend selection on macOS) and choose an action:
 
-- **Reset selected** sets `status` to `pending`, clears `processed_date`, and
-  retains existing metadata. The folders become eligible for a later `export`,
-  provided they are also present in `metadata_folders.json`. A successful
-  export replaces their metadata.
+- **Reset selected** sets `status` to pending (`NULL` in the database), clears
+  `processed_date`, and retains existing metadata. The folders become eligible
+  for a later `export`, which replaces their metadata on success.
 - **Delete selected** permanently deletes the selected folder rows and their
   related metadata and processing-error rows. The UI confirms before deleting.
   Inventoried paths can be added again by running `inventory`, which creates
   new folder IDs for rows that were deleted.
 
-The UI only changes database state; it does not edit the manifest or run
-ExifTool.
+The UI only changes database state; it does not run ExifTool.
 
 ### 2. Export metadata
 
@@ -134,27 +138,22 @@ ExifTool.
 python3 main.py export
 ```
 
-Export reads `metadata_folders.json` incrementally, looks up paths in bounded
-batches, and skips folders already marked `processed`. For each remaining
-folder, it enumerates that folder's direct regular files with `os.scandir()`
-and passes the exact original filesystem paths to ExifTool as argument-list
-items (never through a shell). Large directories are passed in bounded
-batches to avoid operating-system command-line length limits. Child folders
-are processed as their own folder rows rather than recursively rescanned by
-ExifTool. ExifTool returns JSON records, which are inserted into
-`file_metadata`.
+Export selects every folder in `folders` whose status is `NULL` and skips
+folders already marked `processed`. It passes each folder path to ExifTool as
+an argument-list item (never through a shell). ExifTool returns JSON records,
+which are inserted into `file_metadata`.
 
 For each successful folder, the script replaces that folder's metadata rows
-and updates its status from `pending` to `processed` with a `processed_date`.
+and updates its status from pending (`NULL`) to `processed` with a
+`processed_date`.
 Those database changes happen in one transaction. If no files yield metadata
 records, the folder is still marked processed after a successful ExifTool run.
 
 Running `export` repeatedly skips processed folders. Folders left pending due
-to ExifTool errors are attempted again. Running `inventory` does not reset
-existing folder statuses; only newly discovered folders start pending. Use
-**Reset selected** in the folder UI when you want to reprocess selected
-folders. Successful re-exports replace their existing metadata rather than
-adding duplicate rows.
+to ExifTool errors are attempted again. Running `inventory` resets the status
+of each discovered folder to pending. Use **Reset selected** in the folder UI
+when you want to reprocess selected folders. Successful re-exports replace
+their existing metadata rather than adding duplicate rows.
 
 If a folder fails on a later run after having previously succeeded, its
 previous metadata rows are not deleted by the failed run; the folder remains
@@ -162,17 +161,13 @@ pending until a successful export replaces those rows.
 
 Each folder is committed independently. If the program is interrupted, already
 completed folders remain marked `processed`; the current and remaining
-`pending` folders are retried by running `export` again. The database status
-and manifest are the resume state; this version does not use a CSV byte-offset
-checkpoint or generate a CSV file.
+pending folders are retried by running `export` again. The database status is
+the resume state.
 
 #### Verify accented names on the NFS mount
 
 The following focused check locates the two example directories by NFC
-comparison but passes the original byte paths returned by `os.scandir()` to
-the commands. It inventories and exports each selected directory separately.
-If those folder rows are already `processed`, select them in `folders_ui.py`
-and reset them first; inventory deliberately preserves existing status.
+comparison. It inventories and exports each selected directory separately.
 
 ```sh
 python3 - <<'PY'
@@ -207,9 +202,8 @@ PY
 ```
 
 The script only reads directory entries and photo metadata from the NFS mount.
-Inventory writes its manifest beside `main.py` and folder state to PostgreSQL;
-export writes metadata/state to PostgreSQL. Neither command renames, moves,
-deletes, or writes photo files on the NAS.
+Inventory and export write state to PostgreSQL. Neither command renames,
+moves, deletes, or writes photo files on the NAS.
 
 ### Hash photos for exact duplicate detection
 
@@ -227,12 +221,12 @@ and accessible at the paths recorded by ExifTool. Each result is upserted into
 rehashes all currently listed image files, so changed file contents update
 their stored hashes.
 
-Files that cannot be read or change while being hashed are reported in
-`metadata_errors.log` and recorded in `processing_errors` as `hash_file`.
-Their previous hash record is removed so it cannot be mistaken for a current
-result. Hash records for files no longer listed as images in `file_metadata`
-are also removed. A hash run can be interrupted; run it again to refresh all
-image-file hashes.
+Files that cannot be read or change while being hashed are reported to the
+terminal and recorded in `processing_errors` as `hash_file`. Their previous
+hash record is removed so it cannot be mistaken for a current result. Hash
+records for files no longer listed as images in `file_metadata` are also
+removed. A hash run can be interrupted; run it again to refresh all image-file
+hashes.
 
 Use this query to list identical file contents found in more than one folder:
 
@@ -309,19 +303,17 @@ Created by `hash_photos.py`, this table stores a SHA-256 digest and byte size
 for each hashed image path and folder. It references `folders.id` with
 `ON DELETE CASCADE` and is uniquely keyed by `(folder_id, file_path)`.
 
-The script uses `CREATE TABLE IF NOT EXISTS`. It also migrates legacy `NULL`
-folder statuses to `pending`, updates the status default, and replaces the
-previous status constraints. It does not migrate unrelated table structures;
-inspect and migrate other schema differences separately.
+The script uses `CREATE TABLE IF NOT EXISTS` for its hash table and index.
+`main.py` represents pending folders with a `NULL` status; neither script
+migrates an existing `folders` table's status constraints.
 
 ## Errors and retries
 
-Errors are reported to the terminal and appended to the local
-`metadata_errors.log`. Each local log line starts with a UTC timestamp,
-followed by a tab and the message. The log is cleared when `inventory` starts;
-database error rows are not cleared.
+Errors are reported to the terminal. Folder-specific processing errors are
+stored in the `processing_errors` table and are retained across retries and
+inventory runs.
 
-Inventory and export errors are reported in the terminal and local log.
+Inventory and export errors are reported in the terminal.
 ExifTool errors can be reported in two ways:
 
 - A nonzero process exit code is recorded as an `exiftool_command` error, with
@@ -329,7 +321,7 @@ ExifTool errors can be reported in two ways:
 - An `Error` field in an individual ExifTool JSON record is recorded as an
   `exiftool_file` error, including the affected file path.
 
-If ExifTool cannot be launched, the launch error is logged and stored as an
+If ExifTool cannot be launched, the launch error is reported and stored as an
 `exiftool_launch` error. Invalid ExifTool JSON is stored as an
 `exiftool_json` error and stops the current export run. Failed folders are not
 marked processed; export continues to the next folder for ordinary command
@@ -354,15 +346,9 @@ Example: check folders that still need processing:
 ```sql
 SELECT id, path, discovered_date
 FROM folders
-WHERE status = 'pending'
+WHERE status IS NULL
 ORDER BY path;
 ```
 
-## Local files
-
-These files are located beside `main.py`:
-
-- `metadata_folders.json` — folder list used by `export`
-- `metadata_errors.log` — timestamped local error log
-
-Metadata and processing state are stored in PostgreSQL, not in a local CSV.
+All workflow state and metadata are stored in PostgreSQL; no local manifest or
+error-log files are generated.

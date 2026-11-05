@@ -400,3 +400,16 @@ work through this order:
 Keep a separate backup of important development files and configuration.
 This document records the configuration and troubleshooting steps; it is
 not a substitute for backing up the VM.
+
+
+
+reconnecting a rdp session requires to execute the reconnect script to restore keyboard settings:
+Debian xrdp has a dedicated reconnect script:
+/etc/xrdp/reconnectwm.sh
+Keep the existing content and add this at the end:
+```# Restore French Mac keyboard after RDP reconnect
+(
+    sleep 2
+    /usr/bin/setxkbmap -model pc104 -layout fr -variant mac
+) &
+```

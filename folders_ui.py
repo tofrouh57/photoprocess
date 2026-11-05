@@ -45,7 +45,7 @@ def build_folder_query(
         params.append(pattern)
 
     if status_filter == "Pending":
-        conditions.append("status = 'pending'")
+        conditions.append("status IS NULL")
     elif status_filter == "Processed":
         conditions.append("status = 'processed'")
 
@@ -299,7 +299,7 @@ class FolderBrowser:
                     cursor.execute(
                         """
                         UPDATE folders
-                        SET status = 'pending', processed_date = NULL
+                        SET status = NULL, processed_date = NULL
                         WHERE id = ANY(%s)
                         """,
                         (folder_ids,),
