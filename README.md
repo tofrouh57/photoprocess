@@ -53,6 +53,33 @@ export PHOTOPROCESS_DB_NAME='photoprocess'
 export PHOTOPROCESS_DB_USER='postgres'
 ```
 
+### Run the SQL processing pipeline
+
+To run SQL scripts 10 through 90 in dependency order, use the project-root
+runner:
+
+```sh
+bash run_sql_pipeline.sh
+```
+
+The runner stops at the first SQL error. It uses standard `PGHOST`, `PGPORT`,
+`PGDATABASE`, and `PGUSER` settings when set, then the matching
+`PHOTOPROCESS_DB_*` settings, then the defaults above. Provide the password
+through `PGPASSWORD` or `PHOTOPROCESS_DB_PASSWORD`; if neither is set, an
+interactive run prompts for it without echoing the input. Non-interactive
+runs can use PostgreSQL's `.pgpass` file. The runner does not store or print
+the password. To skip the confirmation for intentional non-interactive runs,
+pass `--yes`:
+
+```sh
+bash run_sql_pipeline.sh --yes
+```
+
+This sequence drops and recreates `bronze_file_metadata` and
+`image_copy_manifest`; recreating the manifest resets its copy-tracking
+state. It deliberately does not run the `00_XXX_ drop_processed_tables.sql`
+reset script.
+
 ### Reset the PhotoProcess tables
 
 To drop the PhotoProcess tables and all their data while leaving the database

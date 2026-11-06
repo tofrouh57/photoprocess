@@ -38,8 +38,8 @@ SELECT
     original_filename,
     original_date,
 
-    -- Destination folder: image/YYYY/MM
-    'image/' || TO_CHAR(original_date, 'YYYY/MM') AS destination_folder,
+    -- Destination folder: image/YYYY/MM/DD
+    'image/' || TO_CHAR(original_date, 'YYYY/MM/DD') AS destination_folder,
 
     -- Uppercase filename without accents
     --UPPER(UNACCENT(original_filename)) AS destination_filename,
@@ -65,6 +65,8 @@ COMMIT;
 -- check for duplicates
 
 
+
+/*
 SELECT
     destination_folder,
     destination_filename,
@@ -76,7 +78,7 @@ GROUP BY
     destination_filename
 HAVING COUNT(*) > 1
 ORDER BY occurrences DESC;
-
+*/
 
 -- rename existing duplicate file names
 
@@ -109,10 +111,10 @@ SET destination_filename =
 FROM ranked AS r
 WHERE m.work_id = r.work_id;
 
-
+COMMIT;
 -- check for duplicates
 
-
+/*
 SELECT
     destination_folder,
     destination_filename,
@@ -128,4 +130,4 @@ ORDER BY occurrences DESC;
 
 
 
-
+*/

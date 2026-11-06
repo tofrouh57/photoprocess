@@ -46,7 +46,7 @@ new_rows AS (
         files.source_path,
         files.original_filename,
         files.original_date,
-        'image/check_dates/' || TO_CHAR(files.original_date, 'YYYY/MM'),
+        'image/check_dates/' || TO_CHAR(files.original_date, 'YYYY/MM/DD'),
         files.original_filename,
         FALSE,
         NULL,
@@ -107,7 +107,12 @@ WHERE ranked.work_id = manifest.work_id
 SELECT COUNT(*) AS rows_added
 FROM remaining_manifest_inserted_ids;
 
--- Check for any destination-name collisions.
+
+COMMIT;
+
+
+
+/*-- Check for any destination-name collisions.
 SELECT
     destination_folder,
     destination_filename,
@@ -117,5 +122,4 @@ FROM public.image_copy_manifest
 GROUP BY destination_folder, destination_filename
 HAVING COUNT(*) > 1
 ORDER BY occurrences DESC;
-
-COMMIT;
+*/

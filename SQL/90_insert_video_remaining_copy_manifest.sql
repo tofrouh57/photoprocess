@@ -45,7 +45,7 @@ new_rows AS (
         files.source_path,
         files.original_filename,
         files.original_date,
-        'video/check_dates/' || TO_CHAR(files.original_date, 'YYYY/MM'),
+        'video/check_dates/' || TO_CHAR(files.original_date, 'YYYY/MM/DD'),
         files.original_filename,
         FALSE,
         NULL,
@@ -104,6 +104,7 @@ WHERE ranked.work_id = manifest.work_id
 SELECT COUNT(*) AS video_remaining_rows_added
 FROM video_remaining_manifest_inserted_ids;
 
+/*
 SELECT
     destination_folder,
     destination_filename,
@@ -114,5 +115,6 @@ WHERE destination_folder LIKE 'video/%'
 GROUP BY destination_folder, destination_filename
 HAVING COUNT(*) > 1
 ORDER BY occurrences DESC;
+*/
 
 COMMIT;
