@@ -278,6 +278,29 @@ Matching SHA-256 hashes identify byte-for-byte identical file contents with
 overwhelming confidence. This checks file bytes, not whether two different
 encodings depict the same image.
 
+### Pass 1 reference-file scan
+
+To scan a reference root one directory at a time and store metadata and
+content hashes in PostgreSQL, run:
+
+```sh
+python3 pass1.py /path/to/reference-root
+```
+
+Pass 1 creates `pass1_folders` and `pass1_files`. It records the directory
+structure, runs ExifTool on each directory's direct files in batches, and
+calculates SHA-256 from each file's binary contents. Symlinks are not
+followed. Directory progress and file results are committed to PostgreSQL;
+if interrupted, run the same command with the same root path to resume.
+Directories already completed with unchanged direct file listings are
+skipped. If interrupted during a directory, previously successful files with
+unchanged signatures are reused; incomplete and errored files are retried.
+Individual file errors are stored in `pass1_files`.
+
+The script uses the same database settings and `PHOTOPROCESS_DB_PASSWORD`
+environment variable as the other Python utilities. ExifTool must be
+installed and available on `PATH`.
+
 ## PostgreSQL schema
 
 The script creates these objects in the configured database:

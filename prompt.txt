@@ -1,1 +1,9 @@
-in main.py, i start first with the inventory command to get a list of folders to process later using the export command. sometimes errors happen while running the export command due to corrupted files in the folder. If it happens, exiftool return code is 1. the current fiolder is placed in the processing_errors table and the folder row in the folders table keeps it's status Null. When i run the "errors" command in the script;, i want to select single folder name from the processing_errors table and run exiftool not on folder level but on file level in the affected folder. If exiftool succeeds, then the file metadata shall be placed in the 
+pass1.py ran and created the reference metadata and sha.
+Now i consider the folder as a append only folder. 
+I now need an additional command in pass1.py that compares 
+a folder I give in parameter the to reference data I have in the DB. 
+First with a dry run option I want to identify duplicates and non duplicat's based on binary data. 
+This information shall be store in the table pass1_new_candidates. 
+The table shall be built in the same way as the image_copy_manifest table 
+so it can be used in the copy step where the files will be copied to reference folder.
+The existing pass1 tables have to update after a asuccessfull file copy.
