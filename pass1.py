@@ -4,9 +4,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
@@ -70,6 +73,45 @@ CREATE TABLE IF NOT EXISTS pass1_files (
 CREATE INDEX IF NOT EXISTS pass1_files_status_idx
     ON pass1_files (folder_id, status);
 """
+
+CANDIDATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pass1_new_candidates (
+    id BIGSERIAL PRIMARY KEY,
+    reference_root TEXT NOT NULL,
+    source_root TEXT NOT NULL,
+    source_relative_path TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    media_type TEXT,
+    original_filename TEXT NOT NULL,
+    original_date DATE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content_sha256 CHAR(64),
+    content_size BIGINT,
+    match_status TEXT NOT NULL CHECK (
+        match_status IN ('new', 'duplicate', 'error')
+    ),
+    duplicate_reference_file_id BIGINT,
+    duplicate_reference_path TEXT,
+    destination_folder TEXT,
+    destination_filename TEXT,
+    destination_error TEXT,
+    copied BOOLEAN NOT NULL DEFAULT FALSE,
+    copied_at TIMESTAMPTZ,
+    copy_error TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (reference_root, source_root, source_relative_path)
+);
+
+ALTER TABLE pass1_new_candidates
+    ADD COLUMN IF NOT EXISTS destination_error TEXT;
+
+CREATE INDEX IF NOT EXISTS pass1_new_candidates_copy_idx
+    ON pass1_new_candidates (reference_root, match_status, copied);
+"""
+
+BINARY_DATE_PATTERN = re.compile(r"^(\d{4}):(\d{2}):(\d{2})")
 
 
 @dataclass(frozen=True)
@@ -157,6 +199,14 @@ def ensure_schema(conn):
     with conn.transaction():
         with conn.cursor() as cursor:
             for statement in SCHEMA_SQL.split(";"):
+                if statement.strip():
+                    cursor.execute(statement)
+
+
+def ensure_candidate_schema(conn):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            for statement in CANDIDATE_SCHEMA_SQL.split(";"):
                 if statement.strip():
                     cursor.execute(statement)
 
@@ -302,6 +352,38 @@ def media_type(metadata):
     return None
 
 
+def parse_exif_date(value):
+    if not isinstance(value, str):
+        return None
+    match = BINARY_DATE_PATTERN.match(value.strip())
+    if not match:
+        return None
+    try:
+        return datetime.strptime("-".join(match.groups()), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def candidate_destination(metadata, file_media_type):
+    primary_tag = (
+        "DateTimeOriginal" if file_media_type == "image" else "MediaCreateDate"
+    )
+    primary_date = parse_exif_date(metadata.get(primary_tag))
+    if primary_date:
+        return (
+            primary_date,
+            f"{file_media_type}/{primary_date:%Y/%m/%d}",
+        )
+
+    fallback_date = parse_exif_date(metadata.get("FileModifyDate"))
+    if fallback_date:
+        return (
+            fallback_date,
+            f"{file_media_type}/check_dates/{fallback_date:%Y/%m/%d}",
+        )
+    return None, None
+
+
 def existing_file_states(conn, folder_id, files):
     with conn.cursor() as cursor:
         cursor.execute(
@@ -397,6 +479,407 @@ def mark_folder(conn, folder_id, status, error_message=None):
             )
 
 
+def prepare_reference_hash_lookup(conn, reference_root):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE pass1_reference_hash_lookup
+                ON COMMIT PRESERVE ROWS AS
+                SELECT files.id, files.absolute_path, files.content_sha256,
+                       files.content_size
+                FROM pass1_files AS files
+                JOIN pass1_folders AS folders ON folders.id = files.folder_id
+                WHERE folders.root_path = %s
+                  AND files.content_sha256 IS NOT NULL
+                """,
+                (str(reference_root),),
+            )
+            cursor.execute(
+                """
+                CREATE INDEX pass1_reference_hash_lookup_hash_idx
+                ON pass1_reference_hash_lookup (content_sha256, content_size)
+                """
+            )
+
+
+def prepare_candidate_seen_paths(conn):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE pass1_candidate_seen_paths (
+                    source_relative_path TEXT PRIMARY KEY
+                ) ON COMMIT PRESERVE ROWS
+                """
+            )
+
+
+def find_reference_matches(conn, hashes):
+    if not hashes:
+        return {}
+    content_hashes, content_sizes = zip(*hashes)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT ON (
+                       incoming.content_sha256, incoming.content_size
+                   )
+                   incoming.content_sha256,
+                   incoming.content_size,
+                   reference.id,
+                   reference.absolute_path
+            FROM unnest(%s::CHAR(64)[], %s::BIGINT[])
+                AS incoming(content_sha256, content_size)
+            JOIN pass1_reference_hash_lookup AS reference
+              ON reference.content_sha256 = incoming.content_sha256
+             AND reference.content_size = incoming.content_size
+            ORDER BY incoming.content_sha256, incoming.content_size, reference.id
+            """,
+            (list(content_hashes), list(content_sizes)),
+        )
+        return {
+            (content_sha256.strip(), content_size): (file_id, path)
+            for content_sha256, content_size, file_id, path in cursor.fetchall()
+        }
+
+
+def candidate_row(
+    reference_root,
+    source_root,
+    entry,
+    metadata,
+    file_media_type,
+    content_sha256,
+    content_size,
+    match_status,
+    reference_match,
+    error_message,
+):
+    original_filename = metadata.get("FileName")
+    if not isinstance(original_filename, str) or not original_filename:
+        original_filename = entry.path.name
+    original_date, destination_folder = candidate_destination(
+        metadata, file_media_type
+    )
+    reference_file_id, reference_path = reference_match or (None, None)
+
+    return (
+        str(reference_root),
+        str(source_root),
+        entry.relative_path,
+        str(entry.path),
+        file_media_type,
+        original_filename,
+        original_date,
+        Jsonb(metadata),
+        content_sha256,
+        content_size,
+        match_status,
+        reference_file_id,
+        reference_path,
+        destination_folder,
+        original_filename,
+        (
+            "No usable primary or FileModifyDate for destination folder."
+            if file_media_type in {"image", "video"}
+            and destination_folder is None
+            else None
+        ),
+        error_message,
+    )
+
+
+def store_candidates(conn, rows, seen_paths):
+    if not rows and not seen_paths:
+        return
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            if rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO pass1_new_candidates (
+                        reference_root, source_root, source_relative_path,
+                        source_path, media_type, original_filename, original_date,
+                        metadata, content_sha256, content_size, match_status,
+                        duplicate_reference_file_id, duplicate_reference_path,
+                        destination_folder, destination_filename, destination_error,
+                        error_message
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    ON CONFLICT (
+                        reference_root, source_root, source_relative_path
+                    )
+                    DO UPDATE SET
+                        source_path = EXCLUDED.source_path,
+                        media_type = EXCLUDED.media_type,
+                        original_filename = EXCLUDED.original_filename,
+                        original_date = EXCLUDED.original_date,
+                        metadata = EXCLUDED.metadata,
+                        content_sha256 = EXCLUDED.content_sha256,
+                        content_size = EXCLUDED.content_size,
+                        match_status = EXCLUDED.match_status,
+                        duplicate_reference_file_id =
+                            EXCLUDED.duplicate_reference_file_id,
+                        duplicate_reference_path =
+                            EXCLUDED.duplicate_reference_path,
+                        destination_folder = EXCLUDED.destination_folder,
+                        destination_filename = EXCLUDED.destination_filename,
+                        destination_error = EXCLUDED.destination_error,
+                        copied = CASE
+                            WHEN pass1_new_candidates.content_sha256
+                                = EXCLUDED.content_sha256
+                            THEN pass1_new_candidates.copied
+                            ELSE FALSE
+                        END,
+                        copied_at = CASE
+                            WHEN pass1_new_candidates.content_sha256
+                                = EXCLUDED.content_sha256
+                            THEN pass1_new_candidates.copied_at
+                            ELSE NULL
+                        END,
+                        copy_error = CASE
+                            WHEN pass1_new_candidates.content_sha256
+                                = EXCLUDED.content_sha256
+                            THEN pass1_new_candidates.copy_error
+                            ELSE NULL
+                        END,
+                        error_message = EXCLUDED.error_message,
+                        updated_at = NOW()
+                    """,
+                    rows,
+                )
+            if seen_paths:
+                cursor.executemany(
+                    """
+                    INSERT INTO pass1_candidate_seen_paths (source_relative_path)
+                    VALUES (%s)
+                    ON CONFLICT (source_relative_path) DO NOTHING
+                    """,
+                    [(path,) for path in seen_paths],
+                )
+
+
+def remove_stale_candidates(conn, reference_root, source_root):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM pass1_new_candidates AS candidate
+                WHERE candidate.reference_root = %s
+                  AND candidate.source_root = %s
+                  AND NOT candidate.copied
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pass1_candidate_seen_paths AS seen
+                      WHERE seen.source_relative_path =
+                            candidate.source_relative_path
+                  )
+                """,
+                (str(reference_root), str(source_root)),
+            )
+
+
+def assign_candidate_filenames(conn, reference_root):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY destination_folder,
+                                         LOWER(original_filename)
+                            ORDER BY source_root, source_relative_path, id
+                        ) AS row_number
+                    FROM pass1_new_candidates
+                    WHERE reference_root = %s
+                      AND (match_status = 'new' OR copied)
+                      AND destination_folder IS NOT NULL
+                )
+                UPDATE pass1_new_candidates AS candidate
+                SET destination_filename =
+                    CASE
+                        WHEN ranked.row_number = 1
+                            THEN candidate.original_filename
+                        WHEN candidate.original_filename ~ '\\.[^.]+$'
+                            THEN REGEXP_REPLACE(
+                                candidate.original_filename,
+                                '(\\.[^.]+)$',
+                                '_dup' || (ranked.row_number - 1)::TEXT || '\\1'
+                            )
+                        ELSE candidate.original_filename || '_dup'
+                             || (ranked.row_number - 1)::TEXT
+                    END,
+                    updated_at = NOW()
+                FROM ranked
+                WHERE ranked.id = candidate.id
+                  AND NOT candidate.copied
+                  AND candidate.match_status = 'new'
+                """,
+                (str(reference_root),),
+            )
+
+
+def compare_folder(conn, reference_root, source_root, folder):
+    files, _, _ = scan_directory(folder.path, source_root)
+    counters = {
+        "new": 0,
+        "duplicate": 0,
+        "error": 0,
+        "skipped": 0,
+        "needs_destination": 0,
+    }
+    for start in range(0, len(files), BATCH_SIZE):
+        batch = files[start : start + BATCH_SIZE]
+        metadata_by_path = extract_metadata(batch)
+        processed = []
+        input_hashes = []
+        seen_paths = []
+        for entry in batch:
+            metadata, metadata_error = metadata_by_path[entry.path]
+            file_type = media_type(metadata)
+            if file_type not in {"image", "video"} and not metadata_error:
+                counters["skipped"] += 1
+                continue
+            seen_paths.append(entry.relative_path)
+
+            content_sha256 = None
+            content_size = None
+            errors = []
+            try:
+                content_sha256, content_size = hash_file(entry)
+            except OSError as exc:
+                errors.append(f"SHA-256 failed: {exc}")
+            if metadata_error:
+                errors.append(f"ExifTool failed: {metadata_error}")
+            if file_type not in {"image", "video"}:
+                errors.append("ExifTool did not identify this file as an image or video.")
+            if content_sha256:
+                input_hashes.append((content_sha256, content_size))
+            processed.append(
+                (entry, metadata, file_type, content_sha256, content_size, errors)
+            )
+
+        reference_matches = find_reference_matches(conn, input_hashes)
+        candidate_rows = []
+        for entry, metadata, file_type, content_sha256, content_size, errors in processed:
+            reference_match = (
+                reference_matches.get((content_sha256, content_size))
+                if content_sha256
+                else None
+            )
+            if reference_match:
+                match_status = "duplicate"
+            elif errors:
+                match_status = "error"
+            else:
+                match_status = "new"
+
+            supported_type = file_type if file_type in {"image", "video"} else None
+            _, destination_folder = candidate_destination(metadata, supported_type)
+            if supported_type and destination_folder is None:
+                counters["needs_destination"] += 1
+
+            candidate_rows.append(
+                candidate_row(
+                    reference_root,
+                    source_root,
+                    entry,
+                    metadata,
+                    supported_type,
+                    content_sha256,
+                    content_size,
+                    match_status,
+                    reference_match,
+                    "; ".join(errors) or None,
+                )
+            )
+            counters[match_status] += 1
+            if errors and match_status != "error":
+                counters["error"] += 1
+
+        store_candidates(conn, candidate_rows, seen_paths)
+
+        print(
+            f"  {min(start + len(batch), len(files))}/{len(files)} files scanned "
+            f"in {folder.relative_path}"
+        )
+    return counters
+
+
+def compare_root(reference_root, source_root):
+    reference_root = reference_root.expanduser().resolve()
+    source_root = source_root.expanduser().resolve()
+    if not reference_root.is_dir():
+        raise NotADirectoryError(
+            f"Reference folder does not exist or is not a directory: {reference_root}"
+        )
+    if not source_root.is_dir():
+        raise NotADirectoryError(
+            f"Incoming folder does not exist or is not a directory: {source_root}"
+        )
+
+    folders = discover_folders(source_root)
+    print(
+        f"Discovered {len(folders)} incoming directories under {source_root}; "
+        "recording candidates only (no file copies)."
+    )
+
+    totals = {
+        "new": 0,
+        "duplicate": 0,
+        "error": 0,
+        "skipped": 0,
+        "needs_destination": 0,
+    }
+    with psycopg.connect(**database_settings(), autocommit=True) as conn:
+        acquire_root_lock(conn, reference_root)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM pass1_folders
+                WHERE root_path = %s
+                LIMIT 1
+                """,
+                (str(reference_root),),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError(
+                    f"Reference root has not been indexed by Pass 1: {reference_root}"
+                )
+
+        ensure_candidate_schema(conn)
+        prepare_reference_hash_lookup(conn, reference_root)
+        prepare_candidate_seen_paths(conn)
+
+        for index, folder in enumerate(folders, start=1):
+            print(f"[{index}/{len(folders)}] Comparing {folder.relative_path}")
+            folder_counts = compare_folder(
+                conn, reference_root, source_root, folder
+            )
+            for key, count in folder_counts.items():
+                totals[key] += count
+
+        remove_stale_candidates(conn, reference_root, source_root)
+        assign_candidate_filenames(conn, reference_root)
+
+    print(
+        "Comparison complete: "
+        f"{totals['new']} new, {totals['duplicate']} duplicates, "
+        f"{totals['error']} errors, {totals['needs_destination']} need manual "
+        f"destination dates, {totals['skipped']} unsupported files skipped. "
+        "Candidate rows are stored in pass1_new_candidates; no files were copied "
+        "and pass1_folders/pass1_files were not changed."
+    )
+    return 1 if totals["error"] else 0
+
+
 def process_folder(conn, root, folder, folder_id):
     files, scan_signature, _ = scan_directory(folder.path, root)
     with conn.transaction():
@@ -452,14 +935,43 @@ def process_folder(conn, root, folder, folder_id):
     return attempted, reused, error_count
 
 
-def main():
+def compare_command(argv):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare an incoming folder with a Pass 1 reference and store a "
+            "copy-manifest-style candidate plan."
+        )
+    )
+    parser.add_argument("--reference-root", required=True, type=Path)
+    parser.add_argument("incoming_folder", type=Path)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        required=True,
+        help=(
+            "Store candidate rows only; do not copy files or change the "
+            "existing pass1_folders/pass1_files tables."
+        ),
+    )
+    args = parser.parse_args(argv)
+    try:
+        return compare_root(args.reference_root, args.incoming_folder)
+    except KeyboardInterrupt:
+        report_error("Comparison interrupted. Candidate rows already stored are retained.")
+        return 130
+    except (psycopg.Error, RuntimeError, OSError, ValueError) as exc:
+        report_error(f"ERROR: Pass 1 comparison failed: {exc}")
+        return 1
+
+
+def index_command(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Index each directory's files into resumable pass1_ PostgreSQL tables."
         )
     )
     parser.add_argument("root_folder", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     root = args.root_folder.expanduser().resolve()
     if not root.is_dir():
@@ -539,6 +1051,15 @@ def main():
     except (psycopg.Error, RuntimeError, OSError, ValueError) as exc:
         report_error(f"ERROR: Pass 1 failed: {exc}")
         return 1
+
+
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "compare":
+        return compare_command(arguments[1:])
+    if arguments and arguments[0] == "index":
+        arguments = arguments[1:]
+    return index_command(arguments)
 
 
 if __name__ == "__main__":

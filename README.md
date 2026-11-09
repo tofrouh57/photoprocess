@@ -301,6 +301,63 @@ The script uses the same database settings and `PHOTOPROCESS_DB_PASSWORD`
 environment variable as the other Python utilities. ExifTool must be
 installed and available on `PATH`.
 
+### One-by-one file inventory
+
+To walk a source folder recursively and process each regular file individually
+with ExifTool, then calculate SHA-256 from the file's binary contents, run:
+
+```sh
+python3 onebyone.py list-folders /path/to/source-folder
+python3 onebyone.py inventory
+```
+
+`list-folders` recursively registers the root itself and every descendant
+directory in `one_by_one_folders`, using its absolute path as the unique
+identity. Registering an overlapping root does not add an already registered
+folder again or change its status or scan date. New rows start with `status`
+and `scandate` set to `NULL`.
+`inventory` takes no path argument: it processes every folder row across all
+registered folders whose status is `NULL`, and reads each folder's direct
+regular files (not the descendants again).
+After every file row in a folder has been saved, that folder is marked
+`completed` and `scandate` is set to the completion timestamp. File-level
+ExifTool or hash errors are stored with that file in `one_by_one_inventory`;
+they do not prevent the folder from completing. A folder scan or database
+failure leaves it pending for retry.
+
+Each inventory row stores the containing folder and file path, each
+configured ExifTool tag in its own text column, the SHA-256, ExifTool's return
+code, and any ExifTool or hashing errors. File paths are unique in the
+inventory table. Directories are never passed to ExifTool, and symlinks are
+not followed. Progress is reported while listing folders and processing files.
+
+To compare an incoming folder with an indexed reference and stage a
+copy-manifest-style plan, run:
+
+```sh
+python3 pass1.py compare \
+  --reference-root /path/to/indexed-reference \
+  /path/to/incoming-folder \
+  --dry-run
+```
+
+Comparison requires the exact reference root path previously indexed by
+`pass1.py`. It checks image and video files by SHA-256 plus file size, stores
+new, duplicate, and error candidates in `pass1_new_candidates`, and assigns
+date-based destination folders (`image|video/YYYY/MM/DD`; `check_dates/` uses
+`FileModifyDate` when the primary media date is unavailable). Candidates with
+neither date keep a null destination and record `destination_error` for review.
+Filename collisions among new candidates receive `_dupN` suffixes.
+
+Here, `--dry-run` means **no file copies and no changes to
+`pass1_folders` or `pass1_files`**. It does write candidate rows to the
+database so they can be reviewed and used by a later copy step. Duplicate
+content is recorded but not marked for copying. Copying and updating the
+reference tables after successful copies are not implemented by this command.
+Re-running comparison refreshes candidates for the same incoming root; stale
+uncopied candidates are removed only after the comparison finishes, while
+already copied rows are retained.
+
 ## PostgreSQL schema
 
 The script creates these objects in the configured database:

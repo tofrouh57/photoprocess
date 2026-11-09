@@ -3,7 +3,38 @@ Now i consider the folder as a append only folder.
 I now need an additional command in pass1.py that compares 
 a folder I give in parameter the to reference data I have in the DB. 
 First with a dry run option I want to identify duplicates and non duplicat's based on binary data. 
-This information shall be store in the table pass1_new_candidates. 
+This information shall be store in the table new_candidates. 
 The table shall be built in the same way as the image_copy_manifest table 
 so it can be used in the copy step where the files will be copied to reference folder.
 The existing pass1 tables have to update after a asuccessfull file copy.
+
+
+python3 pass1.py compare --reference-root /mnt/media_reference/image /mnt/ironman/tosort/dumac/archive2014nmoved/0002/ --dry-run
+
+
+
+
+
+
+you are a in charge of creating an application that helps persons to sort there images and videos accumulated over the years.
+For example, there are pictures on a NAS and copies on cumputers and external hard drives. files are probably different on the devices.
+Sometimes the same file exists with different names. there are many possiblitites you can be confronted to.
+
+The process you have to implement shall look like the following:
+1/ build a reference library:
+- you start from scratch
+user shall be able to tell the path to the reference library and the path to the folder that contains the files to be sorted.
+
+It shall be structured by year, month and days. So folder names will be for example reference/2012/04/21.
+
+
+process leaf by leaf.
+for each file in each leaf, compute the sha256 and run exiftool to read metadata.
+The results will be store in a table.
+So if the same folder 
+leaf
+use exiftool to get file metadata.
+for MIMEType image the destination folder will be derived from datetimeorgininal
+
+
+

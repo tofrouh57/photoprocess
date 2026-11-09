@@ -1,11 +1,151 @@
 <mxfile host="Electron">
-  <diagram name="Page-1" id="4keiLS4KGvg-g6vsI_M4">
-    <mxGraphModel dx="1222" dy="850" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+  <diagram name="Page-1" id="ObVJQgAfeo-HfCzBGaeD">
+    <mxGraphModel dx="3882" dy="3294" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="mZADlTigiRX1IX1aViX2-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="fdf" vertex="1">
-          <mxGeometry height="30" width="60" x="230" y="220" as="geometry" />
+        <mxCell id="t8yade_tqgDj0uyXpNPf-50" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-1" parent="1" style="whiteSpace=wrap;html=1;" value="store exif data in table candidate_files" vertex="1">
+          <mxGeometry height="60" width="120" x="430" y="-125" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-28" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-19">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-2" parent="1" style="whiteSpace=wrap;html=1;" value="Loop on exif data" vertex="1">
+          <mxGeometry height="60" width="120" x="430" y="10" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-60" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-59" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-7" parent="1" style="whiteSpace=wrap;html=1;" value="copy file to reference folder" vertex="1">
+          <mxGeometry height="60" width="120" x="655" y="680" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-51" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-2">
+          <mxGeometry relative="1" x="-0.3521" as="geometry">
+            <Array as="points">
+              <mxPoint x="150" y="380" />
+              <mxPoint x="150" y="40" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-9" parent="1" style="whiteSpace=wrap;html=1;" value="mark files as not relevant in the candidate_files table" vertex="1">
+          <mxGeometry height="60" width="120" x="240" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-18" parent="1" style="whiteSpace=wrap;html=1;" value="read exif for folder content.&amp;nbsp;" vertex="1">
+          <mxGeometry height="60" width="120" x="430" y="-390" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-37" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;entryX=0.558;entryY=0.033;entryDx=0;entryDy=0;entryPerimeter=0;" target="t8yade_tqgDj0uyXpNPf-9" value="no">
+          <mxGeometry relative="1" x="-0.7039" as="geometry">
+            <mxPoint x="290" y="450" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-44" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-20">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="730" y="260" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-46" connectable="0" parent="t8yade_tqgDj0uyXpNPf-44" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];inheritText=1;defaultLabelBackgroundColor=page;" value="yes" vertex="1">
+          <mxGeometry relative="1" x="-0.4769" as="geometry">
+            <mxPoint y="1" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-19" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="is MIMEType = &#39;image%&#39; or &#39;video%&#39;?" vertex="1">
+          <mxGeometry height="100" width="100" x="440" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-23" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-22" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-20" parent="1" style="whiteSpace=wrap;html=1;" value="calculate sha256" vertex="1">
+          <mxGeometry height="60" width="120" x="655" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-25" edge="1" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-2" value="yes">
+          <mxGeometry relative="1" x="-0.0122" as="geometry">
+            <Array as="points">
+              <mxPoint x="960" y="540" />
+              <mxPoint x="990" y="540" />
+              <mxPoint x="990" y="40" />
+            </Array>
+            <mxPoint x="960" y="530" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-53" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-52" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-55" connectable="0" parent="t8yade_tqgDj0uyXpNPf-53" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];inheritText=1;defaultLabelBackgroundColor=page;" value="yes" vertex="1">
+          <mxGeometry relative="1" x="-0.0133" y="-2" as="geometry">
+            <mxPoint y="1" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-57" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-22" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;verticalAlign=middle;align=center;" value="&lt;div style=&quot;&quot;&gt;&lt;span style=&quot;text-decoration-line: inherit; background-color: transparent; color: light-dark(#000000, var(--ge-light-color, #ffffff));&quot;&gt;is sha256 already in the reference_files table?&lt;/span&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="120" width="110" x="660" y="480" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-32" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" target="t8yade_tqgDj0uyXpNPf-31" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-34" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-29" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-1">
+          <mxGeometry relative="1" x="-0.0408" as="geometry">
+            <Array as="points">
+              <mxPoint x="700" y="-170" />
+              <mxPoint x="490" y="-170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-29" parent="1" style="whiteSpace=wrap;html=1;" value="apply exif tool file by file" vertex="1">
+          <mxGeometry height="60" width="120" x="650" y="-270" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-33" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-29" value="yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-35" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="t8yade_tqgDj0uyXpNPf-1" value="no">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="490" y="30" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-31" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="Do exiftool have return code &amp;gt;1 ?&amp;nbsp;" vertex="1">
+          <mxGeometry height="80" width="80" x="450" y="-280" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-52" parent="1" style="whiteSpace=wrap;html=1;" value="mark files in the candidate_files as copy_of the file in reference_file table" vertex="1">
+          <mxGeometry height="60" width="120" x="850" y="510" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-56" parent="1" style="whiteSpace=wrap;html=1;align=left;verticalAlign=top;" value="file has to be copied. Determine file destination folder.&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;&quot;&gt;if MIMEType = &#39;video%&#39; ,&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;background-color: transparent; color: light-dark(#000000, var(--ge-light-color, #ffffff));&quot;&gt;and&amp;nbsp;&amp;nbsp;&quot;MediaCreateDate&quot; &amp;gt; TIMESTAMP &#39;2003-12-01&#39;&lt;/span&gt;&lt;div style=&quot;&quot;&gt;&lt;div&gt;AND &quot;MediaCreateDate&quot;::time &amp;gt; TIME &#39;00:00:00&#39;&lt;/div&gt;&lt;div&gt;&lt;div&gt;then file destination folder is .../video/YYYY/MM/DD from MediaCreateDate&lt;/div&gt;&lt;div&gt;else&amp;nbsp;&lt;span style=&quot;background-color: transparent; color: light-dark(#000000, var(--ge-light-color, #ffffff));&quot;&gt;file destination folder is .../video/check_date/YYYY/MM/DD from FileModifyDate&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;if MIMEType = &#39;image%&#39; ,&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;&quot;&gt;AND&lt;/span&gt;&lt;span style=&quot;background-color: transparent; color: light-dark(#000000, var(--ge-light-color, #ffffff));&quot;&gt;&quot;DateTimeOriginal&quot; &amp;gt; TIMESTAMP &#39;2002-06-01&#39;&lt;/span&gt;&lt;div style=&quot;&quot;&gt;&lt;div&gt;AND &quot;DateTimeOriginal&quot;::time &amp;gt; TIME &#39;00:00:00&#39;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;div&gt;&lt;div&gt;then file destination folder is .../YYYY/MM/DD from MediaCreateDate&lt;/div&gt;&lt;div&gt;&lt;div&gt;else &lt;span style=&quot;background-color: transparent;&quot;&gt;file destination folder is .../image/check_date/YYYY/MM/DD from FileModifyDate&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="210" width="540" x="-90" y="605" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-58" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-56" value="rule for destination folder">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-62" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-59" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-61" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-63" connectable="0" parent="t8yade_tqgDj0uyXpNPf-62" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];inheritText=1;defaultLabelBackgroundColor=page;" value="yes" vertex="1">
+          <mxGeometry relative="1" x="-0.1222" y="2" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-59" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="File succesfuly copied?" vertex="1">
+          <mxGeometry height="80" width="80" x="675" y="790" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-61" parent="1" style="whiteSpace=wrap;html=1;" value="add corresponding entry to reference_file table" vertex="1">
+          <mxGeometry height="60" width="120" x="655" y="940" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-71" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-61" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-52">
+          <mxGeometry relative="1" x="-0.2598" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-69" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-67" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-68">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-67" parent="1" style="whiteSpace=wrap;html=1;" value="user has given a source folder to process" vertex="1">
+          <mxGeometry height="60" width="120" x="430" y="-644" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-70" edge="1" parent="1" source="t8yade_tqgDj0uyXpNPf-68" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="t8yade_tqgDj0uyXpNPf-18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="t8yade_tqgDj0uyXpNPf-68" parent="1" style="whiteSpace=wrap;html=1;" value="reccursively find subfolders in source folder." vertex="1">
+          <mxGeometry height="60" width="120" x="430" y="-540" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>
