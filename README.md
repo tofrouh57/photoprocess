@@ -278,28 +278,57 @@ Matching SHA-256 hashes identify byte-for-byte identical file contents with
 overwhelming confidence. This checks file bytes, not whether two different
 encodings depict the same image.
 
-### Pass 1 reference-file scan
+### Pass 1 library setup and reference-file scan
 
-To scan a reference root one directory at a time and store metadata and
-content hashes in PostgreSQL, run:
+Register a library name and its root directory, then index that library:
 
 ```sh
-python3 pass1.py /path/to/reference-root
+python3 pass1.py library create clean /mnt/media_reference
+python3 pass1.py index clean
 ```
 
-Pass 1 creates `pass1_folders` and `pass1_files`. It records the directory
-structure, runs ExifTool on each directory's direct files in batches, and
-calculates SHA-256 from each file's binary contents. Symlinks are not
-followed. Directory progress and file results are committed to PostgreSQL;
-if interrupted, run the same command with the same root path to resume.
+The library name identifies a `pass1_libraries` row; its root path is stored
+once there. `pass1_folders` reference the library, so commands select the
+library by name instead of treating an `image/` category directory as a
+library root. `pass1.py library list` displays registered libraries.
+Re-registering the same name and root is safe and reports that it is already
+registered; using the name or root for a different library reports a conflict.
+
+Indexing records the directory structure, runs ExifTool on each directory's
+direct files in batches, and calculates SHA-256 from each file's binary
+contents. Symlinks are not followed. Directory progress and file results are
+committed to PostgreSQL; if interrupted, run the same command with the same
+library name to resume.
 Directories already completed with unchanged direct file listings are
-skipped. If interrupted during a directory, previously successful files with
+reported and skipped. Folder and file progress is printed with current/total
+counts. If interrupted during a directory, previously successful files with
 unchanged signatures are reused; incomplete and errored files are retried.
 Individual file errors are stored in `pass1_files`.
+
+The new library schema does not migrate the previous Pass 1 tables. To start
+with empty Pass 1 database tables, run `python3 pass1.py reset` and confirm
+with `RESET PASS1`. This permanently removes Pass 1 library, index, source, and
+comparison records, but does not delete media files. Then register libraries
+again. Do not run reset if you need the previous database records.
 
 The script uses the same database settings and `PHOTOPROCESS_DB_PASSWORD`
 environment variable as the other Python utilities. ExifTool must be
 installed and available on `PATH`.
+
+### Pass 1 graphical interface
+
+Launch the Tkinter library browser with:
+
+```sh
+python3 pass1_ui.py
+```
+
+Select or create a named library. Use **Index library** to scan its current
+contents (required before the first copy), then browse to a source folder and
+choose **Copy into selected library** to run `pass1.py copy-source`. The tree
+expands the selected library's indexed folders and files, plus source folders
+and processed files. The process output area displays live folder/file
+progress and results. Creating a library requires its root directory to exist.
 
 ### One-by-one file inventory
 
@@ -336,13 +365,13 @@ copy-manifest-style plan, run:
 
 ```sh
 python3 pass1.py compare \
-  --reference-root /path/to/indexed-reference \
+  --reference-library clean \
   /path/to/incoming-folder \
   --dry-run
 ```
 
-Comparison requires the exact reference root path previously indexed by
-`pass1.py`. It checks image and video files by SHA-256 plus file size, stores
+Comparison requires a registered and indexed library. It checks image and
+video files by SHA-256 plus file size, stores
 new, duplicate, and error candidates in `pass1_new_candidates`, and assigns
 date-based destination folders (`image|video/YYYY/MM/DD`; `check_dates/` uses
 `FileModifyDate` when the primary media date is unavailable). Candidates with
@@ -357,6 +386,33 @@ reference tables after successful copies are not implemented by this command.
 Re-running comparison refreshes candidates for the same incoming root; stale
 uncopied candidates are removed only after the comparison finishes, while
 already copied rows are retained.
+
+### Copy new files from a source tree
+
+To copy new images and videos from another tree into an already indexed
+destination root, run:
+
+```sh
+python3 pass1.py copy-source clean /path/to/source-folder
+```
+
+The command recursively scans the source, extracts metadata and SHA-256 for
+image/video files, and records them in `pass1_source_folders` and
+`pass1_source_files`. Files that ExifTool does not identify as images or videos
+are skipped. A matching SHA-256 in the destination index links the source row
+to that existing `pass1_files` row without copying. Otherwise,
+the file is copied into the existing date-based destination layout
+(`image|video/YYYY/MM/DD`, falling back to
+`image|video/check_dates/YYYY/MM/DD` using `FileModifyDate`), then indexed in
+`pass1_files` and linked from its source row. If a destination filename is
+already occupied by different content, `_dupN` is added rather than
+overwriting it.
+
+The named destination library must first be indexed with `pass1.py`. Folder and
+file progress is printed with current/total counts. Unchanged folders already
+marked completed are reported and skipped on reruns; changed folders and folders
+with errors are processed again. File-level errors are printed and retained in
+`pass1_source_files`. The command does not delete or alter source files.
 
 ## PostgreSQL schema
 
@@ -413,6 +469,20 @@ for each hashed image path and folder. It references `folders.id` with
 The script uses `CREATE TABLE IF NOT EXISTS` for its hash table and index.
 `main.py` represents pending folders with a `NULL` status; neither script
 migrates an existing `folders` table's status constraints.
+
+### `pass1_source_folders` and `pass1_source_files`
+
+Created by `pass1.py copy-source`, these tables track source directories and
+their image/video files. Source file rows contain extracted metadata, the
+SHA-256 and size, processing status and errors, and (when matched or copied)
+the related destination row's `reference_file_id`.
+
+### `pass1_libraries`
+
+Stores each library's unique name and root path. Each `pass1_folders` row
+references its library; `pass1_files` belong to a library through their folder
+row. Source scan folders also reference the destination library they are
+being copied into.
 
 ## Errors and retries
 

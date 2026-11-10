@@ -38,3 +38,32 @@ for MIMEType image the destination folder will be derived from datetimeorgininal
 
 
 
+
+
+
+
+
+
+
+so, pass1 creates a listing of all files present in the folder in parameter. 
+In my case, the destination folder is the one containing the clean list of images and videos.
+Now I need another command in pass1 that browses another folder in parameter. 
+The files of the other folder are recursively found, binary sha256 is calculated
+ and metadata are extracted.
+The data is stored in pass1_source_folders and pass1_source_files table analog 
+to pass1_folders and pass1_files.
+If for one of those files, there is an entry in the pass1_files table with the exact same 
+sha256 entry, then this file gets in the pass1_source_files a reference to the corresponding 
+row in the pass1_files table.
+If the file not is present b(ased on sha256), the file has 
+to be copied into the destination folder according to either datetimeoriginal
+ or mediacreatedate wether it is image or vidoe. If none of those fields 
+ have a valid date, use filemodifydate as fallback and copy the file into 
+ the corresponding location below the check_date folder. after a 
+ successfull copy, append a new row to the pass1_files table for the copied 
+ file in the destination folder and add an reference to it into the pass1_source_files table.
+ . on Error, log the error in the pass1_source_files table and print out the error.
+ The process shall bee invoked using python pass1 copy-source path/to/source/folder path/to/destination/root
+
+ Check the instructions, tell me if it is clear enough to adapt the existing script.
+ Ask me if you need clarification.

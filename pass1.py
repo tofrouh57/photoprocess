@@ -5,14 +5,17 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from main import database_settings, report_error
@@ -35,9 +38,17 @@ BATCH_SIZE = 100
 HASH_CHUNK_SIZE = 1024 * 1024
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pass1_libraries (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    root_path TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS pass1_folders (
     id BIGSERIAL PRIMARY KEY,
-    root_path TEXT NOT NULL,
+    library_id BIGINT NOT NULL
+        REFERENCES pass1_libraries(id) ON DELETE CASCADE,
     relative_path TEXT NOT NULL,
     absolute_path TEXT NOT NULL,
     scan_signature CHAR(64) NOT NULL,
@@ -47,11 +58,11 @@ CREATE TABLE IF NOT EXISTS pass1_folders (
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     error_message TEXT,
-    UNIQUE (root_path, relative_path)
+    UNIQUE (library_id, relative_path)
 );
 
 CREATE INDEX IF NOT EXISTS pass1_folders_status_idx
-    ON pass1_folders (root_path, status);
+    ON pass1_folders (library_id, status);
 
 CREATE TABLE IF NOT EXISTS pass1_files (
     id BIGSERIAL PRIMARY KEY,
@@ -72,6 +83,53 @@ CREATE TABLE IF NOT EXISTS pass1_files (
 
 CREATE INDEX IF NOT EXISTS pass1_files_status_idx
     ON pass1_files (folder_id, status);
+"""
+
+SOURCE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pass1_source_folders (
+    id BIGSERIAL PRIMARY KEY,
+    library_id BIGINT NOT NULL
+        REFERENCES pass1_libraries(id) ON DELETE CASCADE,
+    root_path TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    absolute_path TEXT NOT NULL,
+    scan_signature CHAR(64) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'completed', 'completed_with_errors')),
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    error_message TEXT,
+    UNIQUE (library_id, root_path, relative_path)
+);
+
+CREATE INDEX IF NOT EXISTS pass1_source_folders_status_idx
+    ON pass1_source_folders (library_id, root_path, status);
+
+CREATE TABLE IF NOT EXISTS pass1_source_files (
+    id BIGSERIAL PRIMARY KEY,
+    folder_id BIGINT NOT NULL
+        REFERENCES pass1_source_folders(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    absolute_path TEXT NOT NULL,
+    media_type TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    file_signature CHAR(64),
+    content_sha256 CHAR(64),
+    content_size BIGINT,
+    status TEXT NOT NULL CHECK (status IN ('processed', 'error')),
+    reference_file_id BIGINT
+        REFERENCES pass1_files(id) ON DELETE SET NULL,
+    error_message TEXT,
+    indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (folder_id, relative_path)
+);
+
+CREATE INDEX IF NOT EXISTS pass1_source_files_status_idx
+    ON pass1_source_files (folder_id, status);
+
+CREATE INDEX IF NOT EXISTS pass1_source_files_reference_idx
+    ON pass1_source_files (reference_file_id);
 """
 
 CANDIDATE_SCHEMA_SQL = """
@@ -198,7 +256,51 @@ def discover_folders(root):
 def ensure_schema(conn):
     with conn.transaction():
         with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'pass1_folders'
+                      AND column_name = 'root_path'
+                )
+                """
+            )
+            if cursor.fetchone()[0]:
+                raise RuntimeError(
+                    "The database has the previous Pass 1 schema. This version "
+                    "does not migrate old data; run `pass1.py reset` to start "
+                    "with an empty Pass 1 database."
+                )
             for statement in SCHEMA_SQL.split(";"):
+                if statement.strip():
+                    cursor.execute(statement)
+
+
+def ensure_source_schema(conn):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'pass1_source_folders'
+                      AND column_name = 'root_path'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'pass1_source_folders'
+                      AND column_name = 'library_id'
+                )
+                """
+            )
+            if cursor.fetchone()[0]:
+                raise RuntimeError(
+                    "The database has the previous Pass 1 source schema. Run "
+                    "`pass1.py reset` to start with an empty Pass 1 database."
+                )
+            for statement in SOURCE_SCHEMA_SQL.split(";"):
                 if statement.strip():
                     cursor.execute(statement)
 
@@ -221,7 +323,19 @@ def acquire_root_lock(conn, root):
         cursor.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
 
 
-def register_folders(conn, root, folders):
+def get_library(conn, name):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, root_path FROM pass1_libraries WHERE name = %s",
+            (name,),
+        )
+        library = cursor.fetchone()
+    if library is None:
+        raise ValueError(f"Pass 1 library does not exist: {name}")
+    return library[0], Path(library[1])
+
+
+def register_folders(conn, library_id, root, folders):
     folder_states = {}
     with conn.transaction():
         with conn.cursor() as cursor:
@@ -229,10 +343,10 @@ def register_folders(conn, root, folders):
                 cursor.execute(
                     """
                     INSERT INTO pass1_folders (
-                        root_path, relative_path, absolute_path, scan_signature
+                        library_id, relative_path, absolute_path, scan_signature
                     )
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (root_path, relative_path) DO UPDATE
+                    ON CONFLICT (library_id, relative_path) DO UPDATE
                     SET absolute_path = EXCLUDED.absolute_path,
                         status = CASE
                             WHEN pass1_folders.scan_signature
@@ -259,7 +373,7 @@ def register_folders(conn, root, folders):
                     RETURNING id, status
                     """,
                     (
-                        str(root),
+                        library_id,
                         folder.relative_path,
                         str(folder.path),
                         folder.scan_signature,
@@ -479,7 +593,7 @@ def mark_folder(conn, folder_id, status, error_message=None):
             )
 
 
-def prepare_reference_hash_lookup(conn, reference_root):
+def prepare_reference_hash_lookup(conn, library_id):
     with conn.transaction():
         with conn.cursor() as cursor:
             cursor.execute(
@@ -490,10 +604,10 @@ def prepare_reference_hash_lookup(conn, reference_root):
                        files.content_size
                 FROM pass1_files AS files
                 JOIN pass1_folders AS folders ON folders.id = files.folder_id
-                WHERE folders.root_path = %s
+                WHERE folders.library_id = %s
                   AND files.content_sha256 IS NOT NULL
                 """,
-                (str(reference_root),),
+                (library_id,),
             )
             cursor.execute(
                 """
@@ -812,13 +926,8 @@ def compare_folder(conn, reference_root, source_root, folder):
     return counters
 
 
-def compare_root(reference_root, source_root):
-    reference_root = reference_root.expanduser().resolve()
+def compare_root(reference_library, source_root):
     source_root = source_root.expanduser().resolve()
-    if not reference_root.is_dir():
-        raise NotADirectoryError(
-            f"Reference folder does not exist or is not a directory: {reference_root}"
-        )
     if not source_root.is_dir():
         raise NotADirectoryError(
             f"Incoming folder does not exist or is not a directory: {source_root}"
@@ -838,24 +947,31 @@ def compare_root(reference_root, source_root):
         "needs_destination": 0,
     }
     with psycopg.connect(**database_settings(), autocommit=True) as conn:
+        ensure_schema(conn)
+        library_id, reference_root = get_library(conn, reference_library)
+        if not reference_root.is_dir():
+            raise NotADirectoryError(
+                "Library root does not exist or is not a directory: "
+                f"{reference_root}"
+            )
         acquire_root_lock(conn, reference_root)
         with conn.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT 1
                 FROM pass1_folders
-                WHERE root_path = %s
+                WHERE library_id = %s
                 LIMIT 1
                 """,
-                (str(reference_root),),
+                (library_id,),
             )
             if cursor.fetchone() is None:
                 raise ValueError(
-                    f"Reference root has not been indexed by Pass 1: {reference_root}"
+                    f"Library has not been indexed by Pass 1: {reference_library}"
                 )
 
         ensure_candidate_schema(conn)
-        prepare_reference_hash_lookup(conn, reference_root)
+        prepare_reference_hash_lookup(conn, library_id)
         prepare_candidate_seen_paths(conn)
 
         for index, folder in enumerate(folders, start=1):
@@ -880,8 +996,662 @@ def compare_root(reference_root, source_root):
     return 1 if totals["error"] else 0
 
 
-def process_folder(conn, root, folder, folder_id):
+def register_source_folders(conn, library_id, root, folders):
+    states = {}
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            for folder in folders:
+                cursor.execute(
+                    """
+                    INSERT INTO pass1_source_folders (
+                        library_id, root_path, relative_path, absolute_path,
+                        scan_signature
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (library_id, root_path, relative_path) DO UPDATE
+                    SET absolute_path = EXCLUDED.absolute_path,
+                        status = CASE
+                            WHEN pass1_source_folders.scan_signature
+                                IS DISTINCT FROM EXCLUDED.scan_signature
+                                OR pass1_source_folders.status = 'running'
+                            THEN 'pending'
+                            ELSE pass1_source_folders.status
+                        END,
+                        completed_at = CASE
+                            WHEN pass1_source_folders.scan_signature
+                                IS DISTINCT FROM EXCLUDED.scan_signature
+                                OR pass1_source_folders.status = 'running'
+                            THEN NULL
+                            ELSE pass1_source_folders.completed_at
+                        END,
+                        error_message = CASE
+                            WHEN pass1_source_folders.scan_signature
+                                IS DISTINCT FROM EXCLUDED.scan_signature
+                                OR pass1_source_folders.status = 'running'
+                            THEN NULL
+                            ELSE pass1_source_folders.error_message
+                        END,
+                        scan_signature = EXCLUDED.scan_signature
+                    RETURNING id, status
+                    """,
+                    (
+                        library_id,
+                        str(root),
+                        folder.relative_path,
+                        str(folder.path),
+                        folder.scan_signature,
+                    ),
+                )
+                states[folder.relative_path] = cursor.fetchone()
+    return states
+
+
+def mark_source_folder(conn, folder_id, status, error_message=None):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE pass1_source_folders
+                SET status = %s,
+                    started_at = CASE
+                        WHEN %s = 'running' THEN NOW()
+                        ELSE started_at
+                    END,
+                    completed_at = CASE
+                        WHEN %s IN ('completed', 'completed_with_errors')
+                        THEN NOW()
+                        ELSE NULL
+                    END,
+                    error_message = %s
+                WHERE id = %s
+                """,
+                (status, status, status, error_message, folder_id),
+            )
+
+
+def save_source_file(
+    conn,
+    folder_id,
+    entry,
+    media,
+    metadata,
+    sha256,
+    content_size,
+    status,
+    reference_file_id=None,
+    error_message=None,
+):
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pass1_source_files (
+                    folder_id, relative_path, absolute_path, media_type, metadata,
+                    file_signature, content_sha256, content_size, status,
+                    reference_file_id, error_message
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (folder_id, relative_path) DO UPDATE
+                SET absolute_path = EXCLUDED.absolute_path,
+                    media_type = EXCLUDED.media_type,
+                    metadata = EXCLUDED.metadata,
+                    file_signature = EXCLUDED.file_signature,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    content_size = EXCLUDED.content_size,
+                    status = EXCLUDED.status,
+                    reference_file_id = EXCLUDED.reference_file_id,
+                    error_message = EXCLUDED.error_message,
+                    indexed_at = NOW()
+                """,
+                (
+                    folder_id,
+                    entry.relative_path,
+                    str(entry.path),
+                    media,
+                    Jsonb(metadata),
+                    signature_for_file(entry.signature),
+                    sha256,
+                    content_size,
+                    status,
+                    reference_file_id,
+                    error_message,
+                ),
+            )
+
+
+def reference_file_for_hash(conn, sha256):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id
+            FROM pass1_reference_hash_lookup
+            WHERE content_sha256 = %s
+            ORDER BY id
+            LIMIT 1
+            """,
+            (sha256,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+def remember_reference_file(conn, file_id, path, sha256, content_size):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO pass1_reference_hash_lookup (
+                id, absolute_path, content_sha256, content_size
+            )
+            VALUES (%s, %s, %s, %s)
+            """,
+            (file_id, str(path), sha256, content_size),
+        )
+
+
+def ensure_destination_folders(conn, library_id, root, destination_folder):
+    relative_paths = ["."]
+    parent = Path(destination_folder)
+    if str(parent) != ".":
+        relative_paths.extend(
+            Path(*parent.parts[:index]).as_posix()
+            for index in range(1, len(parent.parts) + 1)
+        )
+
+    folder_ids = {}
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            for relative_path in relative_paths:
+                directory = root if relative_path == "." else root / relative_path
+                _, scan_signature, _ = scan_directory(directory, root)
+                cursor.execute(
+                    """
+                    INSERT INTO pass1_folders (
+                        library_id, relative_path, absolute_path, scan_signature,
+                        status, completed_at
+                    )
+                    VALUES (%s, %s, %s, %s, 'completed', NOW())
+                    ON CONFLICT (library_id, relative_path) DO UPDATE
+                    SET absolute_path = EXCLUDED.absolute_path,
+                        scan_signature = EXCLUDED.scan_signature
+                    RETURNING id
+                    """,
+                    (
+                        library_id,
+                        relative_path,
+                        str(directory),
+                        scan_signature,
+                    ),
+                )
+                folder_ids[relative_path] = cursor.fetchone()[0]
+    return folder_ids[relative_paths[-1]]
+
+
+def candidate_filename(filename, suffix):
+    if suffix == 0:
+        return filename
+    path = Path(filename)
+    if path.suffix:
+        return f"{path.stem}_dup{suffix}{path.suffix}"
+    return f"{filename}_dup{suffix}"
+
+
+def ensure_destination_directory(root, relative_directory):
+    directory = root
+    for component in Path(relative_directory).parts:
+        directory = directory / component
+        directory.mkdir(exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise OSError(
+                f"Destination path contains a non-directory or symlink: {directory}"
+            )
+    return directory
+
+
+def indexed_destination_exists(conn, library_id, path):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM pass1_files AS files
+            JOIN pass1_folders AS folders ON folders.id = files.folder_id
+            WHERE folders.library_id = %s AND files.absolute_path = %s
+            LIMIT 1
+            """,
+            (library_id, str(path)),
+        )
+        return cursor.fetchone() is not None
+
+
+def copy_without_overwrite(
+    source, destination_directory, filename, library_id, conn
+):
+    suffix = 0
+    while True:
+        destination = destination_directory / candidate_filename(filename, suffix)
+        if destination.exists() or os.path.lexists(destination) or indexed_destination_exists(
+            conn, library_id, destination
+        ):
+            suffix += 1
+            continue
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination_directory, prefix=".pass1-copy-", delete=False
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+            shutil.copy2(source, temporary_path)
+            try:
+                os.link(temporary_path, destination)
+            except FileExistsError:
+                suffix += 1
+                continue
+            return destination
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+
+def save_copied_file(
+    conn,
+    library_id,
+    source_folder_id,
+    source_entry,
+    source_metadata,
+    sha256,
+    content_size,
+    destination_root,
+    destination,
+    media,
+):
+    destination_stat = destination.stat()
+    destination_entry = FileEntry(
+        destination,
+        destination.relative_to(destination_root).as_posix(),
+        file_signature(destination_stat),
+    )
+    copied_sha256, copied_size = hash_file(destination_entry)
+    if copied_sha256 != sha256 or copied_size != content_size:
+        if file_signature(destination.stat()) == destination_entry.signature:
+            destination.unlink()
+        raise OSError("Copied file did not match the source SHA-256 and size.")
+
+    destination_folder = destination.parent.relative_to(destination_root).as_posix()
+    destination_folder_id = ensure_destination_folders(
+        conn, library_id, destination_root, destination_folder
+    )
+    metadata = dict(source_metadata)
+    metadata["SourceFile"] = str(destination)
+    metadata["FileName"] = destination.name
+    with conn.transaction():
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pass1_files (
+                    folder_id, relative_path, absolute_path, media_type, metadata,
+                    file_signature, content_sha256, content_size, status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'processed')
+                ON CONFLICT (folder_id, relative_path) DO UPDATE
+                SET absolute_path = EXCLUDED.absolute_path,
+                    media_type = EXCLUDED.media_type,
+                    metadata = EXCLUDED.metadata,
+                    file_signature = EXCLUDED.file_signature,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    content_size = EXCLUDED.content_size,
+                    status = 'processed',
+                    error_message = NULL,
+                    indexed_at = NOW()
+                RETURNING id
+                """,
+                (
+                    destination_folder_id,
+                    destination.name,
+                    str(destination),
+                    media,
+                    Jsonb(metadata),
+                    signature_for_file(destination_entry.signature),
+                    copied_sha256,
+                    copied_size,
+                ),
+            )
+            reference_file_id = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO pass1_source_files (
+                    folder_id, relative_path, absolute_path, media_type, metadata,
+                    file_signature, content_sha256, content_size, status,
+                    reference_file_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'processed', %s)
+                ON CONFLICT (folder_id, relative_path) DO UPDATE
+                SET absolute_path = EXCLUDED.absolute_path,
+                    media_type = EXCLUDED.media_type,
+                    metadata = EXCLUDED.metadata,
+                    file_signature = EXCLUDED.file_signature,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    content_size = EXCLUDED.content_size,
+                    status = 'processed',
+                    reference_file_id = EXCLUDED.reference_file_id,
+                    error_message = NULL,
+                    indexed_at = NOW()
+                """,
+                (
+                    source_folder_id,
+                    source_entry.relative_path,
+                    str(source_entry.path),
+                    media,
+                    Jsonb(source_metadata),
+                    signature_for_file(source_entry.signature),
+                    sha256,
+                    content_size,
+                    reference_file_id,
+                ),
+            )
+    return reference_file_id, copied_sha256, copied_size
+
+
+def copy_source_file(
+    conn, library_id, destination_root, source_folder_id, entry, metadata
+):
+    media = media_type(metadata)
+    if media not in {"image", "video"}:
+        with conn.transaction():
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM pass1_source_files
+                    WHERE folder_id = %s AND relative_path = %s
+                    """,
+                    (source_folder_id, entry.relative_path),
+                )
+        return "skipped"
+
+    sha256, content_size = hash_file(entry)
+    reference_file_id = reference_file_for_hash(conn, sha256)
+    if reference_file_id is not None:
+        save_source_file(
+            conn,
+            source_folder_id,
+            entry,
+            media,
+            metadata,
+            sha256,
+            content_size,
+            "processed",
+            reference_file_id,
+        )
+        return "duplicate"
+
+    _, destination_folder = candidate_destination(metadata, media)
+    if destination_folder is None:
+        raise ValueError(
+            "No usable primary media date or FileModifyDate for destination folder."
+        )
+    destination_directory = ensure_destination_directory(
+        destination_root, destination_folder
+    )
+    original_filename = metadata.get("FileName")
+    if not isinstance(original_filename, str) or not original_filename:
+        original_filename = entry.path.name
+    filename = Path(original_filename.replace("\\", "/")).name
+    if not filename:
+        filename = entry.path.name
+
+    destination = copy_without_overwrite(
+        entry.path, destination_directory, filename, library_id, conn
+    )
+    reference_file_id, copied_sha256, copied_size = save_copied_file(
+        conn,
+        library_id,
+        source_folder_id,
+        entry,
+        metadata,
+        sha256,
+        content_size,
+        destination_root,
+        destination,
+        media,
+    )
+    remember_reference_file(
+        conn, reference_file_id, destination, copied_sha256, copied_size
+    )
+    return f"copied to {destination}"
+
+
+def process_source_folder(
+    conn,
+    library_id,
+    source_root,
+    destination_root,
+    folder,
+    folder_id,
+    folder_index,
+    folder_total,
+):
+    files, _, _ = scan_directory(folder.path, source_root)
+    processed = copied = duplicates = skipped = errors = 0
+    print(f"  Found {len(files)} file(s) in {folder.relative_path}.", flush=True)
+    for start in range(0, len(files), BATCH_SIZE):
+        batch = files[start : start + BATCH_SIZE]
+        batch_end = min(start + len(batch), len(files))
+        print(
+            f"  Extracting metadata for files {start + 1}-{batch_end}/{len(files)}.",
+            flush=True,
+        )
+        try:
+            metadata_by_path = extract_metadata(batch)
+        except RuntimeError as exc:
+            metadata_by_path = {entry.path: ({}, str(exc)) for entry in batch}
+        for batch_index, entry in enumerate(batch, start=1):
+            file_index = start + batch_index
+            print(
+                f"  [Folder {folder_index}/{folder_total}] "
+                f"[File {file_index}/{len(files)}] Processing {entry.path.name}.",
+                flush=True,
+            )
+            metadata, metadata_error = metadata_by_path[entry.path]
+            if metadata_error:
+                try:
+                    sha256, content_size = hash_file(entry)
+                except OSError as exc:
+                    sha256, content_size = None, None
+                    message = f"ExifTool failed: {metadata_error}; SHA-256 failed: {exc}"
+                else:
+                    message = f"ExifTool failed: {metadata_error}"
+                save_source_file(
+                    conn,
+                    folder_id,
+                    entry,
+                    media_type(metadata),
+                    metadata,
+                    sha256,
+                    content_size,
+                    "error",
+                    error_message=message,
+                )
+                report_error(f"ERROR: {entry.path}: {message}")
+                print(
+                    f"  [Folder {folder_index}/{folder_total}] "
+                    f"[File {file_index}/{len(files)}] {entry.path.name}: ERROR",
+                    flush=True,
+                )
+                errors += 1
+                processed += 1
+                continue
+
+            if media_type(metadata) not in {"image", "video"}:
+                copy_source_file(
+                    conn, library_id, destination_root, folder_id, entry, metadata
+                )
+                skipped += 1
+                print(
+                    f"  [Folder {folder_index}/{folder_total}] "
+                    f"[File {file_index}/{len(files)}] {entry.path.name}: "
+                    "skipped (not image/video)",
+                    flush=True,
+                )
+                continue
+
+            try:
+                result = copy_source_file(
+                    conn, library_id, destination_root, folder_id, entry, metadata
+                )
+            except (OSError, ValueError) as exc:
+                try:
+                    sha256, content_size = hash_file(entry)
+                except OSError:
+                    sha256, content_size = None, None
+                message = str(exc)
+                save_source_file(
+                    conn,
+                    folder_id,
+                    entry,
+                    media_type(metadata),
+                    metadata,
+                    sha256,
+                    content_size,
+                    "error",
+                    error_message=message,
+                )
+                report_error(f"ERROR: {entry.path}: {message}")
+                print(
+                    f"  [Folder {folder_index}/{folder_total}] "
+                    f"[File {file_index}/{len(files)}] {entry.path.name}: ERROR",
+                    flush=True,
+                )
+                errors += 1
+            else:
+                if result == "duplicate":
+                    duplicates += 1
+                    file_status = "already in library"
+                elif result.startswith("copied to "):
+                    copied += 1
+                    file_status = result
+                else:
+                    file_status = result
+                print(
+                    f"  [Folder {folder_index}/{folder_total}] "
+                    f"[File {file_index}/{len(files)}] {entry.path.name}: "
+                    f"{file_status}",
+                    flush=True,
+                )
+            processed += 1
+    final_status = "completed_with_errors" if errors else "completed"
+    mark_source_folder(
+        conn,
+        folder_id,
+        final_status,
+        f"{errors} file(s) had errors." if errors else None,
+    )
+    return processed, copied, duplicates, skipped, errors
+
+
+def copy_source_root(source_root, library_name):
+    source_root = source_root.expanduser().resolve()
+    if not source_root.is_dir():
+        raise NotADirectoryError(
+            f"Source folder does not exist or is not a directory: {source_root}"
+        )
+
+    folders = discover_folders(source_root)
+    print(f"Discovered {len(folders)} source directories under {source_root}.")
+    totals = {
+        "files": 0,
+        "copied": 0,
+        "duplicates": 0,
+        "skipped": 0,
+        "errors": 0,
+        "folders_skipped": 0,
+    }
+    with psycopg.connect(**database_settings(), autocommit=True) as conn:
+        ensure_schema(conn)
+        ensure_source_schema(conn)
+        library_id, destination_root = get_library(conn, library_name)
+        if not destination_root.is_dir():
+            raise NotADirectoryError(
+                f"Library root does not exist or is not a directory: {destination_root}"
+            )
+        if (
+            destination_root == source_root
+            or source_root in destination_root.parents
+            or destination_root in source_root.parents
+        ):
+            raise ValueError("Source and destination library roots must not overlap.")
+        for root in sorted({source_root, destination_root}, key=str):
+            acquire_root_lock(conn, root)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1 FROM pass1_folders
+                WHERE library_id = %s
+                LIMIT 1
+                """,
+                (library_id,),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError(
+                    f"Library has not been indexed by Pass 1: {library_name}"
+                )
+        prepare_reference_hash_lookup(conn, library_id)
+        source_folder_ids = register_source_folders(
+            conn, library_id, source_root, folders
+        )
+
+        for index, folder in enumerate(folders, start=1):
+            folder_id, status = source_folder_ids[folder.relative_path]
+            if status == "completed":
+                print(
+                    f"[Folder {index}/{len(folders)}] {folder.relative_path}: "
+                    "already processed; skipping.",
+                    flush=True,
+                )
+                totals["folders_skipped"] += 1
+                continue
+            print(
+                f"[Folder {index}/{len(folders)}] Processing "
+                f"{folder.relative_path}.",
+                flush=True,
+            )
+            mark_source_folder(conn, folder_id, "running")
+            try:
+                counts = process_source_folder(
+                    conn,
+                    library_id,
+                    source_root,
+                    destination_root,
+                    folder,
+                    folder_id,
+                    index,
+                    len(folders),
+                )
+            except OSError as exc:
+                mark_source_folder(conn, folder_id, "completed_with_errors", str(exc))
+                report_error(f"ERROR: Cannot process source folder {folder.path}: {exc}")
+                totals["errors"] += 1
+                continue
+            for key, count in zip(
+                ("files", "copied", "duplicates", "skipped", "errors"), counts
+            ):
+                totals[key] += count
+
+    print(
+        "Source copy complete: "
+        f"{totals['files']} media file(s) processed, {totals['copied']} copied, "
+        f"{totals['duplicates']} linked to existing destination files, "
+        f"{totals['skipped']} unsupported file(s) skipped, "
+        f"{totals['errors']} error(s), "
+        f"{totals['folders_skipped']} already-processed folder(s) skipped."
+    )
+    return 1 if totals["errors"] else 0
+
+
+def process_folder(conn, root, folder, folder_id, folder_index, folder_total):
     files, scan_signature, _ = scan_directory(folder.path, root)
+    print(
+        f"  Found {len(files)} file(s) in {folder.relative_path}.",
+        flush=True,
+    )
     with conn.transaction():
         with conn.cursor() as cursor:
             cursor.execute(
@@ -911,14 +1681,33 @@ def process_folder(conn, root, folder, folder_id):
         ]
         reused += len(batch) - len(todo)
         if not todo:
+            for file_index, entry in enumerate(batch, start=start + 1):
+                print(
+                    f"  [Folder {folder_index}/{folder_total}] "
+                    f"[File {file_index}/{len(files)}] {entry.path.name}: reused",
+                    flush=True,
+                )
             continue
 
+        batch_end = min(start + len(batch), len(files))
+        print(
+            f"  Extracting metadata for {len(todo)} pending file(s) "
+            f"in batch {start + 1}-{batch_end}/{len(files)}.",
+            flush=True,
+        )
         metadata_by_path = extract_metadata(todo)
         outcomes = [
             (entry, *metadata_by_path[entry.path])
             for entry in todo
         ]
         error_count += store_batch(conn, folder_id, outcomes)
+        for file_index, entry in enumerate(batch, start=start + 1):
+            outcome = "reused" if entry not in todo else "recorded"
+            print(
+                f"  [Folder {folder_index}/{folder_total}] "
+                f"[File {file_index}/{len(files)}] {entry.path.name}: {outcome}",
+                flush=True,
+            )
         attempted += len(todo)
         print(
             f"  {min(start + len(batch), len(files))}/{len(files)} files "
@@ -942,7 +1731,7 @@ def compare_command(argv):
             "copy-manifest-style candidate plan."
         )
     )
-    parser.add_argument("--reference-root", required=True, type=Path)
+    parser.add_argument("--reference-library", required=True)
     parser.add_argument("incoming_folder", type=Path)
     parser.add_argument(
         "--dry-run",
@@ -955,12 +1744,35 @@ def compare_command(argv):
     )
     args = parser.parse_args(argv)
     try:
-        return compare_root(args.reference_root, args.incoming_folder)
+        return compare_root(args.reference_library, args.incoming_folder)
     except KeyboardInterrupt:
         report_error("Comparison interrupted. Candidate rows already stored are retained.")
         return 130
     except (psycopg.Error, RuntimeError, OSError, ValueError) as exc:
         report_error(f"ERROR: Pass 1 comparison failed: {exc}")
+        return 1
+
+
+def copy_source_command(argv):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Copy new image and video files from a source tree into an indexed "
+            "Pass 1 destination."
+        )
+    )
+    parser.add_argument("library_name")
+    parser.add_argument("source_folder", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        return copy_source_root(args.source_folder, args.library_name)
+    except KeyboardInterrupt:
+        report_error(
+            "Copy interrupted. Completed file records are retained; rerun the "
+            "same command to resume."
+        )
+        return 130
+    except (psycopg.Error, RuntimeError, OSError, ValueError) as exc:
+        report_error(f"ERROR: Pass 1 source copy failed: {exc}")
         return 1
 
 
@@ -970,22 +1782,21 @@ def index_command(argv):
             "Index each directory's files into resumable pass1_ PostgreSQL tables."
         )
     )
-    parser.add_argument("root_folder", type=Path)
+    parser.add_argument("library_name")
     args = parser.parse_args(argv)
 
-    root = args.root_folder.expanduser().resolve()
-    if not root.is_dir():
-        report_error(f"ERROR: Root folder does not exist or is not a directory: {root}")
-        return 1
-
     try:
-        folders = discover_folders(root)
-        print(f"Discovered {len(folders)} directories under {root}")
-
         with psycopg.connect(**database_settings(), autocommit=True) as conn:
             ensure_schema(conn)
+            library_id, root = get_library(conn, args.library_name)
+            if not root.is_dir():
+                raise NotADirectoryError(
+                    f"Library root does not exist or is not a directory: {root}"
+                )
+            folders = discover_folders(root)
+            print(f"Discovered {len(folders)} directories under {root}")
             acquire_root_lock(conn, root)
-            folder_states = register_folders(conn, root, folders)
+            folder_states = register_folders(conn, library_id, root, folders)
 
             completed = 0
             skipped = 0
@@ -996,14 +1807,21 @@ def index_command(argv):
                 folder_id, status = folder_states[folder.relative_path]
                 if status == "completed":
                     skipped += 1
+                    print(
+                        f"[Folder {index}/{len(folders)}] {folder.relative_path}: "
+                        "already processed; skipping.",
+                        flush=True,
+                    )
                     continue
 
                 print(
-                    f"[{index}/{len(folders)}] Processing {folder.relative_path}"
+                    f"[Folder {index}/{len(folders)}] "
+                    f"Processing {folder.relative_path}.",
+                    flush=True,
                 )
                 try:
                     file_count, file_reused, folder_errors = process_folder(
-                        conn, root, folder, folder_id
+                        conn, root, folder, folder_id, index, len(folders)
                     )
                 except OSError as exc:
                     mark_folder(
@@ -1053,13 +1871,140 @@ def index_command(argv):
         return 1
 
 
+def library_command(argv):
+    parser = argparse.ArgumentParser(description="Manage Pass 1 photo libraries.")
+    commands = parser.add_subparsers(dest="action", required=True)
+    create_parser = commands.add_parser(
+        "create", help="Register a library name and its root directory."
+    )
+    create_parser.add_argument("name")
+    create_parser.add_argument("root", type=Path)
+    commands.add_parser("list", help="List registered libraries.")
+    args = parser.parse_args(argv)
+
+    try:
+        with psycopg.connect(**database_settings(), autocommit=True) as conn:
+            ensure_schema(conn)
+            if args.action == "create":
+                if not args.name.strip():
+                    raise ValueError("Library name must not be empty.")
+                root = args.root.expanduser().resolve()
+                if not root.is_dir():
+                    raise NotADirectoryError(
+                        f"Library root does not exist or is not a directory: {root}"
+                    )
+                with conn.transaction():
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            INSERT INTO pass1_libraries (name, root_path)
+                            VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (args.name, str(root)),
+                        )
+                        cursor.execute(
+                            """
+                            SELECT root_path FROM pass1_libraries WHERE name = %s
+                            """,
+                            (args.name,),
+                        )
+                        existing = cursor.fetchone()
+                        if existing is None or existing[0] != str(root):
+                            cursor.execute(
+                                """
+                                SELECT name FROM pass1_libraries WHERE root_path = %s
+                                """,
+                                (str(root),),
+                            )
+                            root_owner = cursor.fetchone()
+                            if existing is not None:
+                                raise ValueError(
+                                    f"Library name {args.name!r} is already "
+                                    f"registered for {existing[0]}."
+                                )
+                            if root_owner is not None:
+                                raise ValueError(
+                                    f"Library root {root} is already registered "
+                                    f"as {root_owner[0]!r}."
+                                )
+                            raise RuntimeError("Library registration did not persist.")
+                if existing:
+                    print(f"Library {args.name} is already registered: {root}")
+                else:
+                    print(f"Created library {args.name}: {root}")
+            else:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT name, root_path FROM pass1_libraries ORDER BY name"
+                    )
+                    libraries = cursor.fetchall()
+                if not libraries:
+                    print("No Pass 1 libraries registered.")
+                for name, root in libraries:
+                    print(f"{name}\t{root}")
+        return 0
+    except (psycopg.Error, RuntimeError, OSError, ValueError) as exc:
+        report_error(f"ERROR: Pass 1 library command failed: {exc}")
+        return 1
+
+
+def reset_command(argv):
+    parser = argparse.ArgumentParser(
+        description="Delete all Pass 1 database tables and their data."
+    )
+    parser.parse_args(argv)
+    print(
+        "This will permanently delete all Pass 1 libraries, indexes, source "
+        "records, and comparison candidates. It will not delete media files."
+    )
+    if input("Type RESET PASS1 to continue: ").strip() != "RESET PASS1":
+        print("Pass 1 reset cancelled.")
+        return 0
+    try:
+        with psycopg.connect(**database_settings()) as conn:
+            with conn.cursor() as cursor:
+                for table in (
+                    "pass1_new_candidates",
+                    "pass1_source_files",
+                    "pass1_source_folders",
+                    "pass1_files",
+                    "pass1_folders",
+                    "pass1_libraries",
+                ):
+                    cursor.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                            sql.Identifier("public", table)
+                        )
+                    )
+        print("Pass 1 database tables dropped.")
+        return 0
+    except (psycopg.Error, RuntimeError, ValueError) as exc:
+        report_error(f"ERROR: Pass 1 reset failed: {exc}")
+        return 1
+
+
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "library":
+        return library_command(arguments[1:])
+    if arguments and arguments[0] == "reset":
+        return reset_command(arguments[1:])
     if arguments and arguments[0] == "compare":
         return compare_command(arguments[1:])
+    if arguments and arguments[0] == "copy-source":
+        return copy_source_command(arguments[1:])
     if arguments and arguments[0] == "index":
-        arguments = arguments[1:]
-    return index_command(arguments)
+        return index_command(arguments[1:])
+    parser = argparse.ArgumentParser(
+        description="Index and organize image/video libraries with Pass 1."
+    )
+    parser.add_argument(
+        "command",
+        choices=("library", "index", "copy-source", "compare", "reset"),
+    )
+    parser.parse_args(arguments)
+    return 0
 
 
 if __name__ == "__main__":
